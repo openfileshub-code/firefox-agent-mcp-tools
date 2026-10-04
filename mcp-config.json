@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "firefox-agent": {
+      "command": "python",
+      "args": [
+        "src/firefox_agent_mcp/server.py"
+      ],
+      "env": {
+        "PLAYWRIGHT_BROWSER_FILTER": "firefox"
+      }
+    }
+  }
+}
