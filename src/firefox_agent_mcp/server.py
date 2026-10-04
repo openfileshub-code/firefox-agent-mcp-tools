@@ -1,8 +1,7 @@
-import asyncio
 import os
 import time
 import tempfile
-from typing import Optional, List
+from typing import Optional
 
 try:
     from fastmcp import FastMCP, Context
@@ -13,6 +12,7 @@ except ImportError:
 mcp = FastMCP("Firefox Agent MCP")
 
 # Global browser state
+_camoufox_manager = None
 _browser_context = None
 _page_instance = None
 _session_start_time = None
@@ -28,7 +28,7 @@ def get_session_uptime():
 @mcp.tool()
 def browser_start(headless: bool = False) -> str:
     """Starts browser with anti-detect protection (Camoufox preferred). Kills existing instances first. Preserves session cookies between runs."""
-    global _browser_context, _page_instance, _session_start_time, _user_data_dir
+    global _camoufox_manager, _browser_context, _page_instance, _session_start_time, _user_data_dir
     
     try:
         from camoufox.sync_api import Camoufox
@@ -36,11 +36,12 @@ def browser_start(headless: bool = False) -> str:
         return "Error: camoufox is not installed. Run 'pip install camoufox' and 'camoufox fetch' first."
 
     # Stop existing instance if running
-    if _browser_context:
+    if _camoufox_manager:
         try:
-            _browser_context.close()
+            _camoufox_manager.__exit__(None, None, None)
         except Exception:
             pass
+        _camoufox_manager = None
         _browser_context = None
         _page_instance = None
 
@@ -52,18 +53,21 @@ def browser_start(headless: bool = False) -> str:
         os.makedirs(_user_data_dir, exist_ok=True)
 
     try:
-        # Launch Camoufox with persistent context
-        # NOTE: Do NOT use 'window_size'. Camoufox uses 'window' as a tuple (width, height).
-        # We let Camoufox auto-generate window/screen sizes for better anti-detect fingerprinting.
-        _browser_context = Camoufox(
+        # Launch Camoufox with persistent context.
+        # IMPORTANT: Do NOT pass window_size, viewport, or screen directly as kwargs here.
+        # Camoufox handles fingerprinting automatically. 
+        # When persistent_context=True, the context manager yields a BrowserContext directly.
+        _camoufox_manager = Camoufox(
             headless=headless,
             persistent_context=True,
             user_data_dir=_user_data_dir,
-            os="windows",  # Spoof Windows OS fingerprint
-            humanize=True, # Humanize cursor movements
+            os="windows",
+            humanize=True,
             enable_cache=True,
         )
-        _browser_context.__enter__()
+        
+        # __enter__ returns the BrowserContext when persistent_context=True
+        _browser_context = _camoufox_manager.__enter__()
         
         # Get the default page or create one
         pages = _browser_context.pages
@@ -74,18 +78,22 @@ def browser_start(headless: bool = False) -> str:
             
         return f"Browser started successfully. Profile dir: {_user_data_dir}"
     except Exception as e:
+        _camoufox_manager = None
+        _browser_context = None
+        _page_instance = None
         return f"Failed to start Camoufox: {str(e)}"
 
 
 @mcp.tool()
 def browser_stop() -> str:
     """Stops the browser."""
-    global _browser_context, _page_instance
-    if _browser_context:
+    global _camoufox_manager, _browser_context, _page_instance
+    if _camoufox_manager:
         try:
-            _browser_context.__exit__(None, None, None)
+            _camoufox_manager.__exit__(None, None, None)
         except Exception:
             pass
+        _camoufox_manager = None
         _browser_context = None
         _page_instance = None
         return "Browser stopped successfully."
