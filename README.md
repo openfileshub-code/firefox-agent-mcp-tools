@@ -85,3 +85,4 @@ The `browser_get_menu_links` tool uses a clustering approach to identify menus:
 ## License
 
 This project is provided for personal and educational use.
+As is as.
