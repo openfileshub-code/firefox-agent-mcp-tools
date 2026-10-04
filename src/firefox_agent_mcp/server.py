@@ -25,15 +25,6 @@ except ImportError:
     sys.exit(1)
 
 # КРИТИЧНО: импортируем Camoufox ДО запуска event loop!
-# Если импортировать внутри async-функции, playwright.sync_api (который
-# тянется через camoufox/__init__.py) конфликтует с крутящимся asyncio loop
-# и зависает бесконечно. Module-level import происходит при загрузке
-# модуля, когда event loop ещё не запущен.
-#
-# ЕЩЁ ВАЖНЕЕ: MCP-сервер использует stdio transport (JSON-RPC через stdin/stdout).
-# Playwright при импорте/инициализации драйвера МОЖЕТ писать в stdout.
-# Любой мусор в stdout кроме валидного JSON-RPC = MCP-клиент (Unsloth) зависает навсегда.
-# Поэтому ПЕРЕХВАТЫВАЕМ stdout/stderr во время импорта!
 import io as _io
 _old_stdout = sys.stdout
 _old_stderr = sys.stderr
@@ -60,13 +51,9 @@ mcp = FastMCP("FirefoxBrowserAgent")
 
 
 async def nuke_all_browser_processes():
-    """Убивает ВСЕ процессы браузеров, чтобы снять любые lock'и.
-    ВНИМАНИЕ: НЕ убиваем node.exe, иначе можно положить MCP-клиент/Unsloth!
-    КРИТИЧНО: всё через asyncio, ничего не блокирует event loop MCP-сервера!"""
     targets = ["firefox.exe", "camoufox.exe", "playwright.exe"]
     for proc in targets:
         try:
-            # create_subprocess_exec НЕ блокирует event loop (в отличие от subprocess.run)
             proc_obj = await asyncio.create_subprocess_exec(
                 "taskkill", "/F", "/IM", proc, "/T",
                 stdout=asyncio.subprocess.DEVNULL,
@@ -75,14 +62,11 @@ async def nuke_all_browser_processes():
             await proc_obj.wait()
         except Exception as e:
             logger.debug(f"taskkill {proc} skipped: {e}")
-    
-    # Ждём 5 секунд (async, НЕ блокирует event loop!)
     await asyncio.sleep(5)
     logger.info("All browser and driver processes nuked. Waiting 5s complete.")
 
 
 def remove_lock_files(profile_dir: str):
-    """Удаляет parent.lock и другие мусорные файлы из профиля, которые блокируют запуск."""
     if not os.path.exists(profile_dir):
         return
     lock_files = ["parent.lock", "lock", ".parentlock"]
@@ -103,65 +87,39 @@ class BrowserManager:
         self.is_running = False
         self.engine = "none"
         self._keepalive_task = None
-        
         self.profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playwright_profile")
 
     async def start(self, headless: bool = False) -> str:
-        """Запускает Camoufox напрямую, без Playwright fallback-костылей."""
         if self.is_running:
             return "Browser is already running."
-
         try:
-            # 1. Жёстко убиваем всё живое (ASYNC, не блокирует event loop)
             logger.info("STEP 1: Nuking browser processes...")
             await nuke_all_browser_processes()
-            
-            # 2. Создаём папку профиля
             os.makedirs(self.profile_dir, exist_ok=True)
-            
-            # 3. Сносим lock-файлы, если остались от прошлого краша
             logger.info("STEP 2: Removing lock files...")
             remove_lock_files(self.profile_dir)
-            
-            # 4. Camoufox уже импортирован на уровне модуля (см. верх файла)
             if AsyncCamoufox is None:
                 return "❌ camoufox not installed. Run: pip install camoufox[geoip] && python -m camoufox fetch"
             logger.info("STEP 3: AsyncCamoufox available (imported at module level).")
-
-            # 5. Camoufox на Windows в headless=True падает сразу. Форсируем False.
             actual_headless = False
             if headless:
                 logger.warning("Camoufox headless=True crashes on Windows. Forcing headless=False.")
-
-            # 6. Создаём объект Camoufox (конструктор)
-            # КРИТИЧНО: geoip=True вызывает requests.get() ВНУТРИ launch_options(),
-            # который выполняется в run_in_executor и МОЖЕТ ЗАБЛОКИРОВАТЬ импорт
-            # на несколько минут если DNS/сеть тупит. Отключаем, ставим вручную позже.
-            # ВНИМАНИЕ: НЕ передаём window_size или viewport — эти аргументы не поддерживаются
-            # Playwright launch_persistent_context() и вызывают ошибку.
-            # Firefox сам запоминает размер окна через xulstore.json в профиле.
             logger.info("STEP 4: Constructing AsyncCamoufox object...")
             self._camoufox_ctx = AsyncCamoufox(
                 headless=actual_headless,
                 os="windows",
                 humanize=True,
-                geoip=False,             # ОТКЛЮЧЕНО! Блокирует event loop при импорте
+                geoip=False,
                 persistent_context=True,
                 user_data_dir=self.profile_dir,
-                # locale убран — теперь берётся из prefs.js профиля пользователя
-                # чтобы язык и UI-настройки сохранялись между сессиями
             )
             logger.info("STEP 4 complete: AsyncCamoufox object created.")
-            
-            # 7. Входим в контекст (это запускает браузер)
             logger.info("STEP 5: Entering AsyncCamoufox context (launching browser, timeout=60s)...")
             self.context = await asyncio.wait_for(
                 self._camoufox_ctx.__aenter__(), 
                 timeout=60.0
             )
             logger.info("STEP 5 complete: Browser launched successfully!")
-            
-            # 8. Получаем страницу
             logger.info("STEP 6: Getting page...")
             pages = self.context.pages
             if pages:
@@ -169,20 +127,13 @@ class BrowserManager:
             else:
                 self.page = await self.context.new_page()
             logger.info("STEP 6 complete: Page acquired.")
-
             self.is_running = True
             self.engine = "camoufox"
-            
-            # Запускаем keepalive-задачу: раз в 5 минут дёргаем JS, чтобы
-            # браузер не ушёл в idle-shutdown и MCP-сервер не потерял контекст.
-            # Минимум час работы гарантирован (12 * 5 мин = 60 мин).
             if self._keepalive_task and not self._keepalive_task.done():
                 self._keepalive_task.cancel()
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-            
             logger.info(f"STEP 7: ALL DONE. Camoufox running. Profile: {self.profile_dir}")
             return f"✅ Camoufox started successfully.\nProfile dir: {self.profile_dir}\nHeadless: {actual_headless}\nKeepalive: active (min 1h)"
-            
         except asyncio.TimeoutError:
             logger.error("START TIMEOUT: __aenter__() took more than 60s. Browser failed to launch.")
             await self.stop()
@@ -193,28 +144,21 @@ class BrowserManager:
             raise RuntimeError(f"Failed to start Camoufox: {str(e)}")
 
     async def _keepalive_loop(self):
-        """Фоновая задача: каждые 5 минут пингует браузер, чтобы он не уснул.
-        Работает минимум час (12 итераций). Если браузер закрыт — выходит."""
         try:
-            for i in range(12):  # 12 * 5 мин = 60 минут минимум
-                await asyncio.sleep(300)  # 5 минут
+            for i in range(12):
+                await asyncio.sleep(300)
                 if not self.is_running or not self.page:
                     break
                 try:
-                    # Лёгкий JS-пинг: не нагружает CPU, но держит event loop живым
                     await self.page.evaluate("() => document.readyState")
                 except Exception:
-                    # Браузер уже мёртв или страница закрыта — выходим тихо
                     break
         except asyncio.CancelledError:
-            pass  # Нормальное завершение при stop()
+            pass
 
     async def stop(self) -> str:
-        """Закрывает браузер."""
         if not self.is_running and not self._camoufox_ctx:
             return "Browser is not running."
-        
-        # Останавливаем keepalive ДО закрытия контекста
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
             try:
@@ -222,7 +166,6 @@ class BrowserManager:
             except (asyncio.CancelledError, Exception):
                 pass
             self._keepalive_task = None
-            
         try:
             if self._camoufox_ctx:
                 await self._camoufox_ctx.__aexit__(None, None, None)
@@ -235,53 +178,41 @@ class BrowserManager:
             self.is_running = False
             self.engine = "none"
             logger.info("Browser stopped.")
-            
-            # Добиваем зомби после закрытия (async!)
             await nuke_all_browser_processes()
             return "🛑 Browser stopped."
 
     async def navigate(self, url: str) -> str:
-        """Переходит по URL."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
-            
         try:
             response = await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(1.5)
-            
             current_url = self.page.url
             title = await self.page.title()
             status = response.status if response else "unknown"
-            
             logger.info(f"Navigated to {current_url} (Status: {status})")
             return f"✅ Navigated to: {current_url}\nTitle: {title}\nStatus: {status}"
-            
         except Exception as e:
             logger.error(f"Navigation error: {e}")
             return f"❌ Navigation error: {str(e)}"
 
     async def get_content(self) -> str:
-        """Извлекает текст страницы."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
-            
         try:
             html = await self.page.content()
             clean_text = re.sub(r'<script[^>]*?>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
             clean_text = re.sub(r'<style[^>]*?>.*?</style>', '', clean_text, flags=re.DOTALL | re.IGNORECASE)
             clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
             clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-            
             if len(clean_text) > 8000:
                 clean_text = clean_text[:8000] + "\n... [truncated]"
-                
             return clean_text
         except Exception as e:
             logger.error(f"Content extraction error: {e}")
             return f"❌ Content extraction error: {str(e)}"
 
     async def click_element(self, selector: str) -> str:
-        """Кликает по элементу."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -294,31 +225,22 @@ class BrowserManager:
             return f"❌ Click error: {str(e)}"
 
     async def fill_input(self, selector: str, value: str) -> str:
-        """Заполняет поле ввода посимвольно (как человек), чтобы не палиться бот-детектом."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
             await self.page.wait_for_selector(selector, state="visible", timeout=15000)
-            # Кликаем, чтобы фокус был точно на поле
             await self.page.click(selector)
             await asyncio.sleep(0.3)
-            
-            # Очищаем поле (Ctrl+A -> Backspace), чтобы не дописывать в мусор
             await self.page.keyboard.press("Control+a")
             await asyncio.sleep(0.1)
             await self.page.keyboard.press("Backspace")
             await asyncio.sleep(0.1)
-            
-            # Посимвольный ввод через keyboard.type с задержкой 50-120мс
-            # Это надёжнее чем press_sequentially, работает везде
             import random
             for char in value:
                 await self.page.keyboard.type(char, delay=random.uniform(50, 120))
-            
             return f"✅ Filled (human-like): {selector}"
         except Exception as e:
             logger.error(f"Fill error: {e}")
-            # Последний fallback — page.fill, но логируем предупреждение
             try:
                 await self.page.fill(selector, value)
                 logger.warning(f"Used instant fill fallback for {selector} - bot detection risk!")
@@ -327,7 +249,6 @@ class BrowserManager:
                 return f"❌ Fill error: {str(e2)}"
 
     async def screenshot(self, filename: str = "shot.png") -> str:
-        """Делает скриншот."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -339,7 +260,6 @@ class BrowserManager:
             return f"❌ Screenshot error: {str(e)}"
 
     async def select_option(self, selector: str, value: str) -> str:
-        """Выбирает опцию в выпадающем списке <select>."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -352,7 +272,6 @@ class BrowserManager:
             return f"❌ Select error: {str(e)}"
 
     async def press_key(self, key: str) -> str:
-        """Нажимает клавишу клавиатуры."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -364,16 +283,13 @@ class BrowserManager:
             return f"❌ Key press error: {str(e)}"
 
     async def wait_for(self, selector_or_url: str, timeout: int = 15000) -> str:
-        """Ждёт появления элемента или изменения URL."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
             if selector_or_url.startswith(("http://", "https://", "/")) or "/" in selector_or_url:
-                # Ждём изменения URL
                 await self.page.wait_for_url(f"**{selector_or_url}**", timeout=timeout)
                 return f"✅ URL now contains: {selector_or_url}"
             else:
-                # Ждём элемент
                 await self.page.wait_for_selector(selector_or_url, state="visible", timeout=timeout)
                 return f"✅ Element appeared: {selector_or_url}"
         except Exception as e:
@@ -381,25 +297,22 @@ class BrowserManager:
             return f"❌ Wait timeout/error: {str(e)}"
 
     async def evaluate(self, expression: str) -> str:
-        """Выполняет JavaScript и возвращает результат."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
             result = await self.page.evaluate(expression)
-            result_str = str(result)[:2000]  # Ограничиваем длину ответа
+            result_str = str(result)[:2000]
             return f"✅ JS result: {result_str}"
         except Exception as e:
             logger.error(f"Evaluate error: {e}")
             return f"❌ JS error: {str(e)}"
 
     async def get_url(self) -> str:
-        """Возвращает текущий URL."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         return f"📍 Current URL: {self.page.url}"
 
     async def check(self, selector: str) -> str:
-        """Ставит галочку в чекбоксе."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -411,7 +324,6 @@ class BrowserManager:
             return f"❌ Check error: {str(e)}"
 
     async def uncheck(self, selector: str) -> str:
-        """Снимает галочку с чекбокса."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -423,11 +335,6 @@ class BrowserManager:
             return f"❌ Uncheck error: {str(e)}"
 
     async def get_menu_links(self, menu_type: str = "all") -> str:
-        """Извлекает ссылки из навигационных меню страницы через продвинутый JS-парсер.
-        Работает с кастомными меню (div, ul>li, ARIA roles, React/Vue компоненты).
-        Использует кластеризацию ссылок по родительским контейнерам для точного определения меню.
-        menu_type: 'header', 'footer', или 'all' (оба).
-        Возвращает форматированный список 'Текст -> URL'."""
         if not self.is_running or not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -436,21 +343,16 @@ class BrowserManager:
                 const results = [];
                 const seenUrls = new Set();
                 const viewHeight = window.innerHeight || document.documentElement.clientHeight;
-
-                // Мусорные домены и паттерны, которые не являются навигацией
                 const trashPatterns = [
                     'facebook.com', 'twitter.com', 'x.com', 'instagram.com',
                     'linkedin.com', 'youtube.com', 'tiktok.com', 'pinterest.com',
                     'mailto:', 'tel:', 'javascript:', 'data:'
                 ];
-
                 const isTrash = (href) => {
                     if (!href || href === '#' || href.trim() === '') return true;
                     const lower = href.toLowerCase();
                     return trashPatterns.some(t => lower.includes(t));
                 };
-
-                // Определяем секцию по вертикальной позиции элемента
                 const getSection = (el) => {
                     try {
                         const rect = el.getBoundingClientRect();
@@ -462,47 +364,29 @@ class BrowserManager:
                         return 'Unknown';
                     }
                 };
-
-                // Проверяет, является ли элемент частью меню по ARIA, тегам или классам
                 const isMenuContext = (el) => {
                     if (!el || !el.tagName) return false;
-                    
-                    // 1. ARIA roles (самый надёжный признак)
                     const role = (el.getAttribute('role') || '').toLowerCase();
                     if (['navigation', 'menu', 'menubar', 'menuitem', 'tablist'].includes(role)) return true;
-                    
-                    // 2. Семантические теги
                     const tag = el.tagName.toLowerCase();
                     if (['nav', 'header', 'footer'].includes(tag)) return true;
-                    
-                    // 3. Классы и ID (ищем по подстрокам)
                     const classId = ((el.className || '') + ' ' + (el.id || '')).toLowerCase().replace(/[^a-z0-9-_]/g, ' ');
                     const menuKeywords = ['nav', 'menu', 'header', 'footer', 'topbar', 'navbar', 'sidebar', 'main-nav', 'site-nav', 'app-bar', 'toolbar'];
                     if (menuKeywords.some(kw => classId.includes(kw))) return true;
-                    
                     return false;
                 };
-
-                // Собираем ВСЕ ссылки на странице
                 const allLinks = Array.from(document.querySelectorAll('a[href]'));
-                
-                // Группируем ссылки по их ближайшему значимому родителю (до 5 уровней вверх)
                 const clusters = new Map();
-                
                 for (const link of allLinks) {
                     if (isTrash(link.href)) continue;
-                    
                     let container = link.parentElement;
                     let depth = 0;
                     let bestContainer = link.parentElement;
-                    
-                    // Поднимаемся по DOM, ищем контекст меню или общий контейнер
                     while (container && depth < 5 && container !== document.body) {
                         if (isMenuContext(container)) {
                             bestContainer = container;
                             break;
                         }
-                        // Если это список (ul/ol) или div с несколькими ссылками — тоже подходит
                         const tag = container.tagName.toLowerCase();
                         if (tag === 'ul' || tag === 'ol' || tag === 'nav') {
                             bestContainer = container;
@@ -511,46 +395,31 @@ class BrowserManager:
                         container = container.parentElement;
                         depth++;
                     }
-                    
                     if (!clusters.has(bestContainer)) {
                         clusters.set(bestContainer, []);
                     }
                     clusters.get(bestContainer).push(link);
                 }
-
-                // Фильтруем кластеры: меню — это группа из 2+ ссылок
                 for (const [container, links] of clusters.entries()) {
-                    if (links.length < 2) continue; // Одиночные ссылки — не меню
-                    
+                    if (links.length < 2) continue;
                     const section = getSection(container);
-                    
-                    // Фильтр по запрошенному типу меню
                     if (menuType === 'header' && section !== 'Header') continue;
                     if (menuType === 'footer' && section !== 'Footer') continue;
-                    
                     for (const link of links) {
                         const href = link.href;
                         if (seenUrls.has(href)) continue;
                         seenUrls.add(href);
-                        
-                        // Извлекаем текст, очищаем от переносов и лишних пробелов
                         let text = link.textContent.trim().replace(/\\s+/g, ' ');
-                        
-                        // Если текст пустой, пробуем взять aria-label или title
                         if (!text) {
                             text = link.getAttribute('aria-label') || link.getAttribute('title') || link.getAttribute('alt') || '[no text]';
                         }
-                        
                         results.push({
                             section: section,
-                            text: text.substring(0, 100), // Обрезаем слишком длинные тексты
+                            text: text.substring(0, 100),
                             url: href
                         });
                     }
                 }
-
-                // Fallback: если кластеризация ничего не дала (сайт совсем кривой),
-                // берём все ссылки из body, но помечаем как 'Unclassified'
                 if (results.length === 0) {
                     for (const link of allLinks) {
                         if (isTrash(link.href)) continue;
@@ -562,20 +431,15 @@ class BrowserManager:
                             text: text.substring(0, 100),
                             url: link.href
                         });
-                        if (results.length >= 50) break; // Ограничиваем fallback
+                        if (results.length >= 50) break;
                     }
                 }
-
                 return results;
             }
             """
-            
             links = await self.page.evaluate(js_code, menu_type)
-            
             if not links:
                 return f"⚠️ No menu links found (type: {menu_type}). Page might use non-standard navigation or has no links."
-            
-            # Форматируем вывод
             output_lines = [f"📋 Menu links ({menu_type}) — found {len(links)}:\n"]
             current_section = None
             for item in links:
@@ -586,15 +450,10 @@ class BrowserManager:
                 text = item.get('text', '[no text]')
                 url = item.get('url', '')
                 output_lines.append(f"  • {text} → {url}")
-            
             result_text = "\n".join(output_lines)
-            
-            # Ограничиваем длину ответа, чтобы не засрать контекст агента
             if len(result_text) > 10000:
                 result_text = result_text[:10000] + "\n... [truncated, too many links]"
-            
             return result_text
-            
         except Exception as e:
             logger.error(f"Get menu links error: {e}")
             return f"❌ Menu extraction error: {str(e)}"
