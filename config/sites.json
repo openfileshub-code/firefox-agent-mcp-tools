@@ -1,0 +1,19 @@
+{
+  "aliases": {
+    "youtube": "https://www.youtube.com",
+    "yt": "https://www.youtube.com",
+    "ютуб": "https://www.youtube.com",
+    "youtube.com": "https://www.youtube.com",
+    "www.youtube.com": "https://www.youtube.com",
+    "twitch": "https://www.twitch.tv",
+    "twitch.tv": "https://www.twitch.tv",
+    "вотч": "https://www.twitch.tv",
+    "vimeo": "https://vimeo.com",
+    "soundcloud": "https://soundcloud.com",
+    "google": "https://www.google.com",
+    "яндекс": "https://yandex.ru",
+    "wikipedia": "https://www.wikipedia.org",
+    "википедия": "https://ru.wikipedia.org"
+  },
+  "default_search_engine": "https://www.google.com/search?q={query}"
+}
