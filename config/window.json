@@ -1,0 +1,10 @@
+{
+  "width": 1000,
+  "height": 900,
+  "screenx": 0,
+  "screeny": 0,
+  "maximized": false,
+  "use_viewport": false,
+  "save_interval_seconds": 60,
+  "last_saved": null
+}
