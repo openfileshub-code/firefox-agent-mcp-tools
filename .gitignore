@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+playwright_profile/
+mcp_debug.log
+*.log
+.DS_Store
+Thumbs.db
+env/
+.env
