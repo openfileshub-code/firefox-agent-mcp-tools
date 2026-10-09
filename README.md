@@ -1,88 +1,125 @@
-# Firefox Agent MCP Tools
+# firefox-agent-mcp-tools
 
-A set of Model Context Protocol (MCP) tools for browser automation using Firefox. This project includes tools for starting/stopping browsers, navigating pages, interacting with elements (clicks, fills, selections), taking screenshots, and extracting navigation menus.
+---
 
-## Disclaimer
+## 🇷🇺 О ПРОЕКТЕ (РУССКИЙ)
 
-**Note:** This project was developed for personal use and internal workflows. It is provided "as is" without any warranties or guarantees of universal compatibility or suitability for specific use cases. Users are encouraged to review, adapt, and modify the code to fit their specific environments and requirements. The author assumes no liability for any issues, errors, or consequences arising from the use of this software. Use at your own discretion.
+### ⚠️ ВАЖНОЕ УВЕДОМЛЕНИЕ О СТАТУСЕ ПРОЕКТА
 
-## Features
+**Этот проект находится в стадии РАННЕГО предварительного тестирования и считается ДИСПЛЕЙ-КАЧЕСТВА (raw/prototype stage).**
 
-- `browser_start`: Starts browser with anti-detect protection (Camoufox preferred). Kills existing instances first. Preserves session cookies between runs.
-- `browser_stop`: Stops the browser.
-- `browser_navigate`: Navigates to a specified URL.
-- `browser_get_content`: Gets page text/content.
-- `browser_click`: Clicks an element by selector.
-- `browser_fill`: Fills input fields using sequential typing to mimic human behavior.
-- `browser_screenshot`: Takes a screenshot of the page.
-- `browser_select_option`: Selects an option in a `<select>` dropdown by its value attribute.
-- `browser_press_key`: Presses a keyboard key (e.g., 'Enter', 'Tab', 'Escape').
-- `browser_wait_for`: Waits for a CSS selector to appear or for URL to contain a substring.
-- `browser_evaluate`: Executes JavaScript in the browser and returns the result.
-- `browser_get_url`: Returns the current page URL.
-- `browser_check`: Checks a checkbox or radio button.
-- `browser_uncheck`: Unchecks a checkbox.
-- `browser_get_menu_links`: Extracts navigation links from the page menus (header, footer, or all). Uses DOM density analysis to identify menu containers.
+✅ Проект предоставляет функционал для управления браузером Firefox через MCP (Model Context Protocol) интерфейс с использованием Camoufox.
 
-## Installation Manual
+❌ **НЕ ИСПОЛЬЗУЙТЕ ЭТОТ ПРОЕКТ В ПРОИЗВОДСТВЕННЫХ СРЕДАХ.** Код находится в активной разработке, может содержать баги, неполный функционал или нестабильные реализации.
 
-### Prerequisites
+🔬 Проект предназначен для тестирования, исследования и разработки. Любое использование "как есть" осуществляется на ваш собственный риск.
 
-1. Python 3.9+ installed on your system.
-2. Git installed for cloning the repository.
-3. Firefox browser installed on your system.
+---
 
-### Step 1: Clone the Repository
+### 📋 Описание проекта
 
-```bash
-git clone https://github.com/openfileshub-code/firefox-agent-mcp-tools.git
-cd firefox-agent-mcp-tools
+`firefox-agent-mcp-tools` — это набор инструментов MCP (Model Context Protocol) для управления браузером Firefox/Camoufox через ИИ-агентов. Проект предоставляет модульную архитектуру с изолированными компонентами для различных групп функций:
+
+- 🎥 **Управление видеоплеерами** — контроль воспроизведения, качества, субтитров, полноэкранного режима
+- 🪟 **Управление окнами** — сохранение и восстановление размеров и позиций окон браузера
+- 🔗 **Умная навигация и поиск** — фаззи-поиск по ссылкам, нативный поиск на страницах, обход JS-табов
+- 📝 **Заполнение форм** — анализ и заполнение форм на веб-страницах с обнаружением бот-ловушек
+- 📸 **Скриншоты и JS-оценка** — получение снимков страницы и выполнение JavaScript-кода
+
+### 🏗️ Архитектура проекта
+
+```
+firefox-agent-mcp-tools/
+├── server.py                  # Главный файл MCP-сервера с регистрацией инструментов
+├── SKILL.md                   # Навык для ИИ-агента (firefox-agent-browser)
+├── requirements.txt           # Зависимости проекта
+├── .gitignore                # Исключения для Git
+├── config/
+│   ├── sites.json            # Алиасы сайтов (youtube, twitch и т.д.)
+│   └── window.json           # Сохраненные размеры и позиции окон
+├── modules/
+│   ├── __init__.py           # Регистрация модулей
+│   ├── video_controller.py   # Управление видеоплеерами
+│   ├── window_manager.py     # Управление окнами
+│   └── link_cache.py         # Кэш ссылок + фаззи-поиск
+├── playwright_profile/        # Персистентный профиль браузера
+└── mcp_debug.log              # Лог работы сервера
 ```
 
-### Step 2: Create a Virtual Environment
+### 🔧 Особенности
 
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+- **Модульная архитектура** — каждая группа функций управляется флагом `ENABLE_*` в `server.py`
+- **Отключаемое логирование** — конфигурация логирования через `ENABLE_LOGGING` и `LOG_LEVEL`
+- **Защита от галлюцинаций ИИ** — блокировка навигации по плейсхолдер-URL (например, `video_id`, `{id}`)
+- **Строгий режим работы с видео** — запрет прямого JS-вмешательства в плееры, использование только `video_action()`
+- **Постоянный профиль браузера** — сохранение сессий между запусками через `persistent_context=True`
+
+---
+
+## 🇬🇧 PROJECT DESCRIPTION (ENGLISH)
+
+### ⚠️ IMPORTANT PROJECT STATUS NOTICE
+
+**This project is in EARLY preliminary testing stage and is considered RAW/PROTOTYPE quality.**
+
+✅ The project provides functionality for managing Firefox browser through MCP (Model Context Protocol) interface using Camoufox.
+
+❌ **DO NOT USE THIS PROJECT IN PRODUCTION ENVIRONMENTS.** The code is under active development and may contain bugs, incomplete functionality, or unstable implementations.
+
+🔬 The project is intended for testing, research, and development purposes. Any use "as is" is at your own risk.
+
+---
+
+### 📋 Project Description
+
+`firefox-agent-mcp-tools` is a set of MCP (Model Context Protocol) tools for managing Firefox/Camoufox browser through AI agents. The project provides a modular architecture with isolated components for various feature groups:
+
+- 🎥 **Video Player Control** — playback control, quality settings, subtitles, theater mode
+- 🪟 **Window Management** — save and restore browser window size and position
+- 🔗 **Smart Navigation & Search** — fuzzy link search, native page search, JS-tab handling
+- 📝 **Form Tools** — form analysis and filling with bot-trap detection
+- 📸 **Screenshot & JS Evaluate** — page snapshots and JavaScript execution
+
+### 🏗️ Project Architecture
+
+```
+firefox-agent-mcp-tools/
+├── server.py                  # Main MCP server file with tool registration
+├── SKILL.md                   # AI agent skill (firefox-agent-browser)
+├── requirements.txt           # Project dependencies
+├── .gitignore                # Git exclusions
+├── config/
+│   ├── sites.json            # Site aliases (youtube, twitch, etc.)
+│   └── window.json           # Saved window sizes and positions
+├── modules/
+│   ├── __init__.py           # Module registration
+│   ├── video_controller.py   # Video player control
+│   ├── window_manager.py     # Window management
+│   └── link_cache.py         # Link cache + fuzzy search
+├── playwright_profile/        # Persistent browser profile
+└── mcp_debug.log              # Server log file
 ```
 
-### Step 3: Install Dependencies
+### 🔧 Features
 
-Install the required Python packages:
+- **Modular architecture** — each feature group is managed by an `ENABLE_*` flag in `server.py`
+- **Toggleable logging** — logging configuration via `ENABLE_LOGGING` and `LOG_LEVEL`
+- **AI hallucination protection** — blocks navigation to placeholder URLs (e.g., `video_id`, `{id}`)
+- **Strict video control mode** — prohibits direct JS interference with players, uses only `video_action()`
+- **Persistent browser profile** — session preservation between launches via `persistent_context=True`
 
-```bash
-pip install camoufox playwright
-playwright install firefox
-```
+---
 
-*Note: Depending on your specific setup, you may also need `jsonrpc-stream`, `mcp` (Model Context Protocol server library), or other dependencies used in the MCP server implementation.*
-
-### Step 4: Configure the MCP Server
-
-1. Locate the MCP server configuration file in your AI agent or IDE (e.g., VS Code, Cursor, or custom MCP host).
-2. Add the server configuration pointing to the Python script (e.g., the main server file with MCP tools).
-3. Ensure the script has execution permissions and the Python virtual environment is activated.
-
-### Step 5: Run the MCP Server
+### 🚀 Quick Start
 
 ```bash
-python your_server_script.py
+# Install dependencies
+pip install -r requirements.txt
+
+# Run server
+python server.py
 ```
 
-## Usage
+### 📄 License
 
-The MCP tools can be invoked by your AI agent or host application using the standard MCP protocol. Ensure the browser automation tools are enabled in your MCP server configuration.
-
-## Menu Extraction Logic
-
-The `browser_get_menu_links` tool uses a clustering approach to identify menus:
-
-- Menus are identified as groups of links within a container.
-- The tool traverses the DOM tree (up to 3 levels up) and calculates link density.
-- High-density containers are identified as menus.
-- Garbage links (social media like `facebook.com`, `twitter.com`, anchors like `#`, `javascript:void(0)`, empty links) are filtered out.
-
-## License
-
-This project is provided for personal and educational use.
-As is as.
+This project is provided "as is" for testing and development purposes.
