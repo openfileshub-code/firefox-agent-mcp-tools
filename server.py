@@ -17,6 +17,7 @@ import platform
 import asyncio
 import re
 import random
+import time
 from typing import Any, Dict, List, Optional
 
 # ================================================================
@@ -138,6 +139,51 @@ KEEPALIVE_SIGNAL_GUARD = os.environ.get(
     "FIREFOX_MCP_KEEPALIVE_SIGNAL_GUARD", "1"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# ---------------------------------------------------------------
+# DETACHED BROWSER DAEMON (the robust fix for "browser dies exactly
+# N minutes after the last chat message").
+#
+# Diagnosis: hosts like Cursor/Unbound close the stdio session and then
+# SIGKILL the whole MCP server process tree on an idle timer (~5 min).
+# SIGKILL is uncatchable — no in-process guard (atexit detach, signal
+# handler, __aexit__ wrapper) can stop it from taking the browser with it,
+# because Camoufox's Python driver kills the node driver and Firefox when
+# its own process dies. The only reliable remedy is to run the browser in
+# a SEPARATE OS process that is not part of our process group, so a
+# host-side SIGKILL of the server cannot reach it.
+#
+# Architecture (default mode FIREFOX_MCP_BROWSER_MODE=daemon):
+#   server.py  --(subprocess.Popen, new session)--->  browserd.py daemon
+#                                                       └── Camoufox/Firefox
+#   Control channel: JSON-RPC over stdin/stdout pipes + WS handshake file.
+#   The daemon ALSO watches its parent pipe; if the server closes it
+#   (graceful session end) the daemon keeps the browser alive by policy.
+#   browser_stop() is the ONLY deliberate teardown path.
+#
+# Fallback mode FIREFOX_MCP_BROWSER_MODE=inprocess restores the previous
+# in-process behaviour (still useful under hosts that never SIGKILL).
+# ---------------------------------------------------------------
+BROWSER_MODE = os.environ.get("FIREFOX_MCP_BROWSER_MODE", "daemon").strip().lower()
+DAEMON_SCRIPT = os.path.join(BASE_DIR, "browserd.py")
+# How long the daemon may take to bring up the browser (seconds).
+DAEMON_START_TIMEOUT = float(os.environ.get("FIREFOX_MCP_DAEMON_START_TIMEOUT", "90"))
+# Idle time after which the daemon releases the CDP proxy connection to the
+# browser (the browser itself keeps running either way — this is cosmetic).
+DAEMON_IDLE_RELEASE_S = float(os.environ.get("FIREFOX_MCP_DAEMON_IDLE_RELEASE", "120"))
+# Named-pipe control channel used ONLY when a new MCP server session needs
+# to re-attach to a daemon spawned by a previous (killed) session. The
+# daemon always listens on this pipe IN ADDITION to its stdin/stdout pipe,
+# so the normal fast path (same-session JSON-RPC over pipes) is unchanged.
+if os.name == "nt":
+    DAEMON_PIPE_NAME = r"\\.\pipe\firefox-mcp-browserd"
+else:
+    DAEMON_PIPE_NAME = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "firefox-mcp-browserd.sock")
+
+# Default navigation/action timeout in milliseconds. Defined at module level
+# so it is available both inside BrowserManager methods (default arguments are
+# evaluated at class-definition time) and in the tool functions below.
+DEFAULT_TIMEOUT_MS = 30000
 
 from contextlib import asynccontextmanager
 
@@ -293,6 +339,9 @@ async def _server_lifespan(_app: Any):
             logger.info("MCP session ended — stopping browser (opt-in policy).")
             await browser_manager.stop()
         elif browser_manager.is_running:
+            # Drop only OUR control connection; daemon + browser survive.
+            if BROWSER_MODE == "daemon":
+                await browser_manager._cleanup_pw_client()
             logger.info(
                 "MCP session ended — browser kept alive (decoupled policy). "
                 "Next server start will reuse or clean up this instance."
@@ -313,11 +362,19 @@ try:
     _AsyncCamoufox = _AC
     logger.info("Camoufox imported successfully.")
 except Exception as e:
-    logger.critical(f"Failed to import AsyncCamoufox: {e}")
-    sys.stdout = _original_stdout
-    sys.stderr = _original_stderr
-    _builtin_print(f"❌ FATAL: Could not initialize Camoufox. Error: {e}", file=sys.stderr)
-    sys.exit(1)
+    # In daemon mode the browser is launched by browserd.py (a separate OS
+    # process), so the server itself does not need the camoufox package at
+    # all. Only hard-exit when it is actually required (in-process mode).
+    if BROWSER_MODE == "inprocess":
+        logger.critical(f"Failed to import AsyncCamoufox: {e}")
+        sys.stdout = _original_stdout
+        sys.stderr = _original_stderr
+        _builtin_print(f"❌ FATAL: Could not initialize Camoufox. Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    logger.warning(
+        f"AsyncCamoufox import failed ({e}); tolerated because "
+        f"BROWSER_MODE={BROWSER_MODE} (browser runs in detached daemon)."
+    )
 
 # Import modules
 from modules.link_cache import LinkCache
@@ -681,9 +738,18 @@ def _validate_url(url: str) -> Optional[str]:
             "Use browser_find_link() or browser_navigate_smart() to find the actual link on the page first."
         )
     if url.startswith("/"):
-        # Relative paths only make sense when already on a page (origin context).
-        page = browser_manager.page
-        current = getattr(page, "url", "") if page else ""
+        # Relative paths only make sense when already on a page (origin
+        # context). In daemon mode there is no local Page object, so consult
+        # the tab mirror instead. Synchronous best-effort read.
+        current = ""
+        if browser_manager.is_daemon_mode:
+            idx = min(getattr(browser_manager, "_daemon_active", 0),
+                      max(0, len(getattr(browser_manager, "_daemon_urls", [])) - 1))
+            urls = getattr(browser_manager, "_daemon_urls", [])
+            current = urls[idx] if urls else ""
+        else:
+            page = browser_manager.page
+            current = getattr(page, "url", "") if page else ""
         if not current or current == "about:blank":
             return (
                 f"❌ Cannot navigate to relative path '{url}': no page is open yet. "
@@ -740,6 +806,125 @@ def _format_link_results(results: List[Dict[str, Any]], limit: int = 15) -> str:
 # ================================================================
 # BROWSER MANAGER
 # ================================================================
+class _SocketProcess:
+    """Minimal stand-in for asyncio.subprocess.Process backed by a unix
+    socket writer (POSIX orphan adoption)."""
+
+    def __init__(self, pid: int, writer: Any) -> None:
+        self.pid = pid
+        self.stdin = writer
+        self.stdout = None
+        self.returncode: Optional[int] = None
+        self._writer = writer
+        self._adopted = True   # no child handle -> explicit liveness checks
+
+    async def wait(self) -> int:
+        # Socket closed => daemon gone.
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                if self._writer.is_closing():
+                    self.returncode = -1
+                    return -1
+        except Exception:
+            self.returncode = -1
+            return -1
+
+    def kill(self) -> None:
+        try:
+            os.kill(self.pid, _signal.SIGTERM)
+        except Exception:
+            pass
+
+
+class _PipeHandleProcess:
+    """Stand-in Process for an adopted Windows named-pipe daemon connection."""
+
+    def __init__(self, pid: int, handle: Any, rd_fd: int) -> None:
+        self.pid = pid
+        self.handle = handle
+        self.rd_fd = rd_fd
+        self.returncode: Optional[int] = None
+        self._adopted = True   # no child handle -> explicit liveness checks
+        self.stdin = _PipeWriter(self)
+
+    @staticmethod
+    def read_from_handle(handle: Any) -> Optional[bytes]:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore
+        buf = ctypes.create_string_buffer(4096)
+        got = ctypes.c_ulong(0)
+        ok = kernel32.ReadFile(handle, buf, 4096, ctypes.byref(got), None)
+        if not ok:
+            ERROR_BROKEN_PIPE = 109
+            ERROR_MORE_DATA = 232
+            ERROR_NO_DATA = 232          # non-blocking pipe, no pending data
+            ERROR_PIPE_NOT_CONNECTED = 233
+            ERROR_ACCESS_DENIED = 5      # peer closed => our handle dead
+            err = kernel32.GetLastError()
+            if err == ERROR_BROKEN_PIPE or err == ERROR_PIPE_NOT_CONNECTED:
+                return None              # EOF
+            if err == ERROR_NO_DATA:
+                return b""               # nothing to read right now
+            if err == ERROR_ACCESS_DENIED:
+                return None
+            return b""                   # transient error — retry next tick
+        if got.value == 0:
+            return b""
+        return bytes(buf.raw[:got.value])
+
+    async def wait(self) -> int:
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                import subprocess as _sp
+                out = _sp.run(["tasklist", "/FI", f"PID eq {self.pid}", "/NH"],
+                              capture_output=True, text=True, timeout=5).stdout
+                if str(self.pid) not in out:
+                    self.returncode = -1
+                    return -1
+            except Exception:
+                pass
+
+    def kill(self) -> None:
+        try:
+            import subprocess as _sp
+            _sp.run(["taskkill", "/PID", str(self.pid), "/T", "/F"],
+                    capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+
+class _PipeWriter:
+    """asyncio StreamWriter-like object writing JSON lines to a pipe handle."""
+
+    def __init__(self, proc: "_PipeHandleProcess") -> None:
+        self._proc = proc
+
+    def write(self, data: bytes) -> None:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore
+        written = ctypes.c_ulong(0)
+        buf = ctypes.create_string_buffer(data, len(data))
+        ok = kernel32.WriteFile(self._proc.handle, buf, len(data),
+                                ctypes.byref(written), None)
+        if not ok:
+            raise RuntimeError("named-pipe write failed (daemon gone?)")
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(self._proc.handle)
+        except Exception:
+            pass
+
+    def is_closing(self) -> bool:
+        return False
+
+
 class BrowserManager:
     """Central browser lifecycle and interaction manager."""
 
@@ -785,11 +970,675 @@ class BrowserManager:
 
         self.sites_config = SITES_CONFIG
 
+        # --- Detached-daemon mode state (see browserd.py) ---
+        self._daemon_proc: Optional[asyncio.subprocess.Process] = None
+        self._daemon_reader: Optional[asyncio.StreamReader] = None
+        # Serialises JSON-RPC round-trips over the single shared pipe.
+        self._daemon_lock: asyncio.Lock = asyncio.Lock()
+        self._daemon_ws: str = ""          # playwright WS endpoint of daemon
+        self._daemon_handshake_path: str = os.path.join(
+            self.profile_dir, "browserd.json")
+        self._pw_connect: Any = None       # async_playwright instance (server side)
+        self._connected_browser: Any = None  # Browser from connect(ws_endpoint)
+        # Daemon-mode page mirrors: the real Page objects live in browserd;
+        # we keep tab metadata here and route JS through the JSON-RPC pipe.
+        self._daemon_urls: list = []
+        self._daemon_active: int = 0
+        # JSON objects seen on the daemon stdout that are NOT protocol frames
+        # (no "event"/"id" keys) — foreign chatter from libraries printing to
+        # stdout. Quarantined so they can never be mistaken for RPC replies.
+        self._daemon_foreign_msgs: list = []
+
+    @property
+    def is_daemon_mode(self) -> bool:
+        """True while THIS session's lifecycle owner is the detached daemon.
+
+        Routing decision for every tool must depend ONLY on session state
+        (engine + transport present), never on a live child-process handle:
+          • daemons we spawned ourselves → _daemon_proc is an asyncio child;
+            asyncio sets its .returncode when it exits, so a dead daemon
+            stops routing automatically;
+          • adopted orphan daemons (_PipeHandleProcess/_SocketProcess) carry
+            a *static* returncode that never updates — their liveness is
+            verified explicitly in _daemon_call via the `_adopted` flag and
+            the CIM/proc/cmdline check, and the watchdog resets state if the
+            pipe peer dies.
+        Previous bug #1: requiring a live child handle here made
+        is_daemon_mode False after successful adoption — every tool fell
+        through to the in-process path ("Browser not started." although the
+        daemon window was alive).
+        Previous bug #2: checking only `engine == "camoufox-daemon"` without
+        the transport left tools calling self.page == None right after
+        browser_start() set engine (before the first tabs round-trip),
+        producing the same confusing error on the FIRST tool call of a fresh
+        daemon session. Both are covered by requiring the transport handles.
+        """
+        return (self.engine == "camoufox-daemon"
+                and self._daemon_proc is not None
+                and self._daemon_reader is not None
+                and self._daemon_proc.returncode is None)
+
+    async def _daemon_call(self, cmd: str, params: Optional[Dict[str, Any]] = None,
+                           timeout: float = 30.0) -> Dict[str, Any]:
+        """JSON-RPC round-trip to browserd with extra params.
+
+        The pipe is a single shared stdin/stdout pair — two concurrent
+        tool calls interleaving requests would scramble replies (responses
+        matched to the wrong ids). A per-manager asyncio.Lock serialises
+        every round-trip; daemon commands are short so contention is fine.
+        """
+        async with self._daemon_lock:
+            return await self._daemon_call_unlocked(cmd, params, timeout)
+
+    async def _daemon_call_unlocked(self, cmd: str,
+                                    params: Optional[Dict[str, Any]] = None,
+                                    timeout: float = 30.0) -> Dict[str, Any]:
+        # Works both for a child we spawned ourselves (stdin/stdout pipes)
+        # and for an adopted orphan daemon (aux control channel wrapped in
+        # _SocketProcess/_PipeHandleProcess — same .stdin/.stdout shape).
+        proc = self._daemon_proc
+        reader = self._daemon_reader
+        if proc is None or reader is None:
+            raise RuntimeError("Browser not started.")
+        # An adopted daemon (via the aux control channel) has no child handle
+        # we can poll for exit — a dead pipe/peer may otherwise leave
+        # returncode=None forever. Verify liveness explicitly so tools stop
+        # routing through a broken transport instead of hanging on it.
+        if getattr(proc, "_adopted", False):
+            try:
+                alive = await asyncio.wait_for(self._daemon_alive(proc.pid),
+                                               timeout=10.0)
+            except Exception:
+                alive = True  # checker failed — be conservative
+            if not alive:
+                proc.returncode = -1
+                raise RuntimeError("daemon process is gone")
+        rid = random.randint(1, 2**31)
+        payload = {"id": rid, "cmd": cmd}
+        if params:
+            payload.update(params)
+        try:
+            proc.stdin.write(
+                (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            raise RuntimeError(
+                f"daemon pipe closed ({e.__class__.__name__})") from e
+        while True:
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"daemon did not answer '{cmd}' within {timeout:.0f}s")
+            if not line:
+                raise RuntimeError("daemon pipe closed")
+            raw = line.decode("utf-8", "ignore").rstrip()
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                # Foreign plain-text chatter on stdout (e.g. camoufox's
+                # "Skipping unknown patch ..." print): keep it visible.
+                if raw:
+                    logger.warning(f"[browserd:raw] {raw[:200]}")
+                continue
+            if msg.get("event") == "log":
+                lvl = str(msg.get("level") or "info").lower()
+                text = f"[browserd:{lvl}] {msg.get('msg')}"
+                if lvl in ("warning", "error"):
+                    logger.warning(text)
+                else:
+                    logger.info(text)
+                continue
+            if isinstance(msg, dict) and "event" not in msg and "id" not in msg:
+                # Foreign JSON printed to the daemon's stdout by some library
+                # (same quarantine as in _spawn_daemon): never treat it as a
+                # reply — matching on a missing id would silently swallow it,
+                # but logging keeps it visible for diagnosis.
+                self._daemon_foreign_msgs.append(msg)
+                logger.warning(f"[browserd:foreign-json] {raw[:200]}")
+                continue
+            if msg.get("id") == rid:
+                if not msg.get("ok"):
+                    raise RuntimeError(msg.get("error", f"daemon '{cmd}' failed"))
+                return msg
+
+    async def _daemon_refresh_tabs(self) -> None:
+        try:
+            res = await self._daemon_call("tabs", timeout=10.0)
+            self._daemon_urls = [t.get("url", "") for t in res.get("tabs", [])]
+            self._daemon_active = int(res.get("active", self._daemon_active))
+        except Exception as e:
+            logger.debug(f"tab refresh failed: {e}")
+
+    def _read_handshake(self) -> Optional[Dict[str, Any]]:
+        """Read handshake file, validate version, ignore stale ppid."""
+        try:
+            with open(self._daemon_handshake_path, "r", encoding="utf-8") as fh:
+                info = json.load(fh)
+                if not isinstance(info, dict):
+                    return None
+                if info.get("profile") != self.profile_dir:
+                    return None
+                version = info.get("daemon_version", 1)
+                if version < 1 or version > 10:
+                    logger.warning(f"Unknown handshake version {version}, proceeding cautiously")
+                return info
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            logger.debug(f"Handshake read failed: {e}")
+            return None
+
+    def _remove_handshake(self) -> None:
+        try:
+            os.remove(self._daemon_handshake_path)
+        except OSError:
+            pass
+
+    def _pid_cmdline_is_daemon(self, pid: int) -> bool:
+        """POSIX: verify the PID is really OUR browserd (cmdline check)."""
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmd = fh.read().decode("utf-8", "ignore").replace("\0", " ")
+            return "browserd.py" in cmd and self.profile_dir in cmd
+        except OSError:
+            return False
+
+    async def _daemon_alive(self, pid: int) -> bool:
+        """Is a *browserd* process with this PID still running?"""
+        if pid <= 0:
+            return False
+        # Fast path: daemon spawned by THIS server session.
+        if self._daemon_proc is not None and self._daemon_proc.pid == pid \
+                and self._daemon_proc.returncode is None:
+            return True
+        if os.name == "nt":
+            # A recycled PID could belong to any Windows process; verify the
+            # command line actually references OUR daemon + profile (CIM via
+            # PowerShell), mirroring the POSIX /proc/cmdline check.
+            try:
+                import subprocess as _sp
+                ps = (
+                    "Get-CimInstance Win32_Process -Filter \"ProcessId="
+                    + str(pid) + "\" | Select-Object -ExpandProperty CommandLine"
+                )
+                out = _sp.run(["powershell", "-NoProfile", "-Command", ps],
+                              capture_output=True, text=True, timeout=8).stdout
+                return ("browserd.py" in out) and (self.profile_dir in out)
+            except Exception:
+                # Cannot tell — be conservative: assume alive so we never
+                # kill/replace a possibly-live daemon; stop()/cleanup can
+                # still reclaim via handshake file removal.
+                return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+        # A recycled PID could belong to an unrelated process — make sure it
+        # is actually our daemon before treating it as alive.
+        return self._pid_cmdline_is_daemon(pid)
+
+    async def _attach_context(self, context: Any) -> None:
+        """Adopt a Playwright BrowserContext (from Camoufox or connect())."""
+        self.context = context
+        pages = context.pages
+        self._pages = list(pages) if pages else []
+        if not self._pages:
+            self._pages.append(await context.new_page())
+        self._active_page_index = 0
+        for p in self._pages:
+            p.on("close", lambda p=p: self._on_page_closed(p))
+        self._setup_page_tracking(context)
+        self.is_running = True
+        self.engine = "camoufox"
+        self._user_closed_event.clear()
+
+    # ---------------- detached daemon control channel ----------------
+
+    async def _daemon_request(self, cmd: str, timeout: float = 15.0) -> Dict[str, Any]:
+        # Same locked round-trip as _daemon_call (kept for call-site clarity).
+        return await self._daemon_call(cmd, None, timeout)
+
+    async def _spawn_daemon(self, headless: bool) -> Dict[str, Any]:
+        args = [DAEMON_SCRIPT, "--profile", self.profile_dir,
+                "--idle-release", str(DAEMON_IDLE_RELEASE_S)]
+        if headless:
+            args.append("--headless")
+
+        daemon_log = os.path.join(BASE_DIR, "browserd.log")
+
+        env = os.environ.copy()
+        env.setdefault("PLAYWRIGHT_SKIP_BROWSER_GC", "1")
+
+        # --- FIND pythonw.exe to avoid console window ---
+        python_exe = sys.executable
+        python_dir = os.path.dirname(python_exe)
+        pythonw_exe = os.path.join(python_dir, "pythonw.exe")
+        
+        use_pythonw = os.path.isfile(pythonw_exe)
+        if use_pythonw:
+            interpreter = pythonw_exe
+            logger.info(f"Using pythonw.exe (no console): {pythonw_exe}")
+        else:
+            interpreter = python_exe
+            logger.info(f"pythonw.exe not found, using python.exe: {python_exe}")
+        
+        args.insert(0, interpreter)
+        # --- END pythonw selection ---
+
+        popen_kwargs: Dict[str, Any] = dict(
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=BASE_DIR,
+            env=env,
+        )
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        else:
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            
+            popen_kwargs["creationflags"] = (
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+            )
+            
+            # Add startupinfo for extra safety
+            try:
+                import subprocess as _sp
+                si = _sp.STARTUPINFO()
+                si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0  # SW_HIDE
+                popen_kwargs["startupinfo"] = si
+            except Exception:
+                pass
+
+        self._daemon_proc = await asyncio.create_subprocess_exec(*args, **popen_kwargs)
+        self._daemon_reader = self._daemon_proc.stdout
+
+        # Wait for the ready event (daemon launches Camoufox before replying).
+        self._daemon_foreign_msgs = []
+        deadline = time.monotonic() + DAEMON_START_TIMEOUT
+        exit_seen = False
+        while time.monotonic() < deadline:
+            try:
+                line = await asyncio.wait_for(
+                    self._daemon_reader.readline(), timeout=max(1.0, deadline-time.monotonic()))
+            except asyncio.TimeoutError:
+                break
+            if not line:
+                exit_seen = True
+                break
+            raw = line.decode("utf-8", "ignore").rstrip()
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                with open(daemon_log, "a", encoding="utf-8") as fh:
+                    fh.write(raw+"\n")
+                logger.warning(f"[browserd:raw] {raw}")
+                continue
+            if isinstance(msg, dict) and "event" not in msg and "id" not in msg:
+                self._daemon_foreign_msgs.append(msg)
+                logger.warning(f"[browserd:foreign-json] {raw[:200]}")
+                continue
+            if msg.get("event") == "log":
+                logger.info(f"[browserd:{msg.get('level')}]: {msg.get('msg')}")
+            elif msg.get("event") == "ready":
+                self._daemon_ws = msg.get("ws_endpoint", "")
+                return msg
+
+        rc = self._daemon_proc.returncode
+        if exit_seen or rc is not None:
+            raise RuntimeError(
+                f"daemon exited during startup (rc={rc}); last errors in {daemon_log}")
+        raise RuntimeError(
+            f"daemon did not become ready within {DAEMON_START_TIMEOUT}s; check {daemon_log}")
+     
+
+    async def _connect_over_ws(self, ws_endpoint: str) -> Any:
+        """Connect to the daemon's Playwright WS server and take its default
+        persistent context (the one Camoufox launched with our profile)."""
+        from playwright.async_api import async_playwright  # noqa: PLC0415
+        self._pw_connect = await async_playwright().start()
+        # Daemon runs a FIREFOX-driver playwright ws-server (Camoufox is
+        # Gecko-based), so attach with the matching driver family.
+        browser = await asyncio.wait_for(
+            self._pw_connect.firefox.connect(ws_endpoint), timeout=30.0)
+        contexts = browser.contexts
+        if not contexts:
+            raise RuntimeError("daemon exposes no browser context over WS")
+        return contexts[0]
+
+    async def _start_daemon_mode(self, headless: bool) -> str:
+        # 1) A daemon from a previous session may still own the browser.
+        info = self._read_handshake()
+        if info and await self._daemon_alive(int(info.get("pid", -1))):
+            pid = int(info["pid"])
+            
+            # ← FIX: Added small delay to allow daemon to fully initialize
+            # This prevents race condition when server restarts quickly
+            await asyncio.sleep(0.5)
+
+            # Same server process (e.g. after an internal restart attempt):
+            # our live pipe is still open — re-attach transparently.
+            if self._daemon_proc is not None and self._daemon_proc.pid == pid \
+            and self._daemon_proc.returncode is None:
+                try:
+                    pong = await self._daemon_request("ping", timeout=10.0)
+                    if pong.get("ok"):
+                        self.is_running = True
+                        return (f"♻️ Re-attached to running browser daemon "
+                                f"(pid={pid}). Browser window is alive.")
+                except Exception as e:
+                    logger.warning(f"Ping failed on existing proc: {e}")
+
+            # ← FIX: Removed ppid check - it's no longer in handshake
+            # Daemon was spawned by a PREVIOUS server session whose pipe is
+            # gone. Verify liveness strictly via cmdline check.
+            if os.name == "nt":
+                if not await self._daemon_alive(pid):
+                    self._remove_handshake()
+                    info = None
+                elif not self._pid_cmdline_is_daemon(pid):
+                    self._remove_handshake()
+                    info = None
+            else:  # POSIX
+                if not await self._daemon_alive(pid):
+                    self._remove_handshake()
+                    info = None
+                elif not self._pid_cmdline_is_daemon(pid):
+                    self._remove_handshake()
+                    info = None
+
+            if info is not None:
+                # Try to adopt the orphaned daemon through its secondary
+                # control channel (named pipe / unix socket).
+                try:
+                    adopted = await self._adopt_orphan_daemon(pid)
+                    if adopted:
+                        pong = await self._daemon_call("ping", timeout=10.0)
+                        if pong.get("ok"):
+                            self.is_running = True
+                            self.engine = "camoufox-daemon"
+                            self._intentional_stop = False
+                            _install_keepalive_signal_guard()
+                            if self._keepalive_task is None or self._keepalive_task.done():
+                                try:
+                                    self._keepalive_task = asyncio.create_task(
+                                        self._keepalive_loop())
+                                except RuntimeError:
+                                    pass
+                            await self._daemon_refresh_tabs()
+                            return (f"♻️ Re-attached to running browser daemon "
+                                    f"(pid={pid}) via control channel — full "
+                                    f"agent control restored.")
+                except Exception as e:
+                    logger.debug(f"orphan adoption failed: {e}")
+
+            # Adoption impossible: the WINDOW must still survive
+            return (
+                f"♻️ Browser is already running in detached daemon mode "
+                f"(daemon pid={pid}, window owned by it).\n"
+                "The current chat server cannot reattach Playwright to that "
+                "browser (Gecko persistent contexts are not servable over an "
+                "endpoint), so options:\n"
+                " • Keep watching/controlling it MANUALLY — video/audio keep "
+                "going regardless of chat activity.\n"
+                f" • Take full control again: run `python browserd.py --kill "
+                f"--profile {self.profile_dir}` (or close the window), then "
+                "call browser_start() anew."
+            )
+
+        if info:
+            self._remove_handshake()  # stale handshake from a dead daemon
+
+        # 2) Fresh detached start.
+        await cleanup_stale_browser_processes(self.profile_dir)
+        remove_lock_files(self.profile_dir)  # daemon will create its own
+        actual_headless = bool(headless)
+        if headless and _headless_unsafe_platform():
+            logger.warning("Camoufox headless=True crashes on Windows. Forcing False.")
+            actual_headless = False
+        ready = await self._spawn_daemon(actual_headless)
+        self._intentional_stop = False
+        _install_keepalive_signal_guard()
+        # Watchdog must also run in daemon mode: it detects a daemon crash or
+        # the user closing the browser window and resets state accordingly.
+        if self._keepalive_task is None or self._keepalive_task.done():
+            try:
+                self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            except RuntimeError:
+                pass  # no running loop (unit tests) — watchdog optional
+        # Adopt whatever tabs the daemon already has (usually one) BEFORE
+        # declaring success. This is also the transport smoke-test: if the
+        # first round-trip fails, we must NOT leave a half-initialised
+        # session behind — that was bug #3: browser_start() returned ✅ while
+        # the pipe/handshake state was broken, and every following tool call
+        # died with "Browser not started." with no way to recover short of
+        # killing the daemon manually.
+        try:
+            tabs = await self._daemon_request("tabs", timeout=20.0)
+            urls = [t.get("url", "") for t in tabs.get("tabs", [])]
+            self._daemon_urls = urls or [""]
+            self._daemon_active = int(tabs.get("active", 0))
+        except Exception as e:
+            logger.error(f"Daemon smoke-test failed: {e}", exc_info=True)
+            # Tear down our view of the session; the daemon + window stay
+            # alive (we never kill the browser on a control-channel hiccup).
+            proc = self._daemon_proc
+            adopted = bool(getattr(proc, "_adopted", False)) if proc else False
+            # IMPORTANT: closing OUR write handle to the child's stdin makes
+            # the daemon detach — but only when we spawned it ourselves and
+            # its aux takeover channel is verified working.  Otherwise the
+            # detached daemon would drop the handshake and then sit there
+            # uncontactable, locking the profile against every future start
+            # (this was the Windows "daemon pipe closed" cascade).  When in
+            # doubt: keep stdin open, keep the handshake, let the user close
+            # the visible window manually — cleanup_stale_browser_processes()
+            # reclaims the profile afterwards.
+            takeover_ok = False
+            if proc is not None and not adopted:
+                try:
+                    pong = await self._daemon_request("ping", timeout=10.0)
+                    takeover_ok = bool(pong.get("ok"))
+                except Exception as pe:
+                    logger.warning(
+                        f"stdin takeover ping failed ({pe}); leaving the "
+                        f"daemon attached to us rather than orphaning it")
+            if proc is not None and not adopted and takeover_ok:
+                try:
+                    if getattr(proc, "stdin", None):
+                        proc.stdin.close()
+                except Exception:
+                    pass
+                # The daemon will detach and exit soon; stop routing tools
+                # through this broken transport.
+            self._daemon_proc = None
+            self._daemon_reader = None
+            self.engine = "none"
+            self.is_running = False
+            if adopted:
+                hint = ("Next browser_start() will retry the named-pipe "
+                        "control channel automatically.")
+            elif takeover_ok:
+                hint = ("The daemon detached cleanly; next browser_start() "
+                        "will take over that window via the named-pipe "
+                        "control channel automatically.")
+            else:
+                hint = ("Close the browser window manually, then call "
+                        "browser_start() anew.")
+            raise RuntimeError(
+                f"daemon became ready but the first control round-trip "
+                f"failed ({e}). The browser window is still open. {hint} "
+                f"If it keeps failing, run `python browserd.py --kill "
+                f"--profile {self.profile_dir}` and set "
+                f"FIREFOX_MCP_BROWSER_MODE=inprocess as a fallback.")
+        self.is_running = True
+        self.engine = "camoufox-daemon"
+        self._user_closed_event.clear()
+        return (f"✅ Camoufox started in detached daemon mode "
+                f"(daemon pid={ready.get('pid')}; survives chat idle & host "
+                f"kills of this server process). Control channel verified.\n"
+                f"Profile: {self.profile_dir}\nHeadless: {actual_headless}")
+
+    async def _adopt_orphan_daemon(self, pid: int) -> bool:
+        """Open the daemon's secondary control channel (named pipe on Windows,
+        unix socket on POSIX) and wire it in place of the lost stdin/stdout
+        pipe. Returns True on success."""
+        if os.name == "nt":
+            import threading
+            loop = asyncio.get_running_loop()
+            holder: Dict[str, Any] = {}
+
+            def _open_blocking() -> Any:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32  # type: ignore
+                GENERIC_READ = 0x80000000
+                GENERIC_WRITE = 0x40000000
+                OPEN_EXISTING = 3
+                h = kernel32.CreateFileW(
+                    DAEMON_PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, None,
+                    OPEN_EXISTING, 0, None)
+                # INVALID_HANDLE_VALUE == -1 as a signed 64-bit value
+                val = ctypes.c_void_p(h).value
+                if val is None or val >= 0xFFFFFFFFFFFFFFFE:
+                    raise OSError(
+                        f"CreateFileW failed: {kernel32.GetLastError()}")
+                return h
+
+            try:
+                last_err: Optional[Exception] = None
+                for _attempt in range(10):   # daemon may be mid-command
+                    try:
+                        holder["h"] = await loop.run_in_executor(
+                            None, _open_blocking)
+                        break
+                    except OSError as e:
+                        last_err = e
+                        await asyncio.sleep(0.5)
+                else:
+                    raise last_err or OSError("pipe connect failed")
+            except Exception as e:
+                logger.debug(f"named-pipe open failed: {e}")
+                return False
+
+            # Windows named pipes opened with CreateFileW default to
+            # *blocking* mode: ReadFile parks the thread until data arrives.
+            # A single parked blocking read also prevents any other thread
+            # from completing a write on the same handle — so in the adopted
+            # orphan session every daemon reply got stuck and each tool call
+            # hit its timeout ("Browser not started" after state reset).
+            # Fix: create a SECOND handle to the same pipe dedicated to reads
+            # and put it into non-blocking mode via SetNamedPipeHandleState
+            # (fNonBlocking=1). WriteFile stays on the original handle;
+            # ReadFile returns immediately when no message is pending.
+            def _make_reader_handle(h_write: Any) -> Any:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32  # type: ignore
+                GENERIC_READ = 0x80000000
+                OPEN_EXISTING = 3
+                h_read = kernel32.CreateFileW(
+                    DAEMON_PIPE_NAME, GENERIC_READ, 0, None,
+                    OPEN_EXISTING, 0, None)
+                val = ctypes.c_void_p(h_read).value
+                if val is None or val >= 0xFFFFFFFFFFFFFFFE:
+                    raise OSError(f"CreateFileW(read) failed: {kernel32.GetLastError()}")
+                NONBLOCKING = 1
+                ok = kernel32.SetNamedPipeHandleState(
+                    h_read, ctypes.c_ulong(NONBLOCKING), None, None, None)
+                if not ok:
+                    logger.debug(
+                        f"SetNamedPipeHandleState(nonblock): {kernel32.GetLastError()}")
+                return h_read
+
+            try:
+                h_read = await loop.run_in_executor(None, _make_reader_handle, holder["h"])
+            except Exception as e:
+                logger.debug(f"named-pipe reader handle failed: {e}")
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.CloseHandle(holder["h"])
+                except Exception:
+                    pass
+                return False
+
+            proc = _PipeHandleProcess(pid, holder["h"], -1)
+            reader = asyncio.StreamReader(limit=2 ** 20)
+
+            def _pump() -> None:
+                buf = b""
+                try:
+                    while True:
+                        chunk = _PipeHandleProcess.read_from_handle(h_read)
+                        if chunk is None:      # broken pipe / EOF
+                            break
+                        if chunk == b"":        # no data right now
+                            time.sleep(0.05)
+                            continue
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            try:
+                                loop.call_soon_threadsafe(
+                                    reader.feed_data, line + b"\n")
+                            except RuntimeError:
+                                return
+                finally:
+                    try:
+                        loop.call_soon_threadsafe(reader.feed_eof)
+                    except RuntimeError:
+                        pass
+
+            threading.Thread(target=_pump, daemon=True,
+                             name="browserd-pipe-pump").start()
+            self._daemon_proc = proc
+            self._daemon_reader = reader
+            return True
+
+        # POSIX: connect to the unix socket, wrap with asyncio streams.
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(DAEMON_PIPE_NAME), timeout=5.0)
+        except Exception as e:
+            logger.debug(f"unix socket connect failed: {e}")
+            return False
+        self._daemon_proc = _SocketProcess(pid, writer)
+        self._daemon_reader = reader
+        return True
+
+    async def _cleanup_pw_client(self) -> None:
+        """Drop OUR side of the WS connection without touching the browser."""
+        try:
+            if self._connected_browser is not None:
+                self._connected_browser.close()  # sync transport: fire-forget
+        except Exception:
+            pass
+        self._connected_browser = None
+        try:
+            if self._pw_connect is not None:
+                await self._pw_connect.stop()
+        except Exception:
+            pass
+        self._pw_connect = None
+
     # --- Lifecycle ---
 
     async def start(self, headless: bool = False) -> str:
         if self.is_running:
             return "Browser is already running."
+        # Detached-daemon mode (default): the browser lives in a separate OS
+        # process so host-side idle kills of THIS server cannot take it down.
+        if BROWSER_MODE == "daemon":
+            try:
+                return await self._start_daemon_mode(headless=headless)
+            except Exception as e:
+                logger.error(f"Daemon-mode start failed: {e}", exc_info=True)
+                raise RuntimeError(
+                    f"Failed to start browser daemon: {e}. "
+                    "Set FIREFOX_MCP_BROWSER_MODE=inprocess to use the legacy "
+                    "in-process mode."
+                ) from e
         try:
             logger.info("Starting browser...")
             os.makedirs(self.profile_dir, exist_ok=True)
@@ -883,6 +1732,15 @@ class BrowserManager:
         the window / process crashed) and reset our state so the next tool
         call gives a clean "not started" answer instead of acting on a dead
         page. It NEVER closes or restarts the browser by itself.
+
+        IMPORTANT: the watchdog is scoped to the lifecycle it actually owns:
+          • daemon mode   → poll the daemon child-process exit code only
+            (self._daemon_proc). It must NOT touch self.context / pages,
+            which are managed exclusively by the daemon transport.
+          • in-process    → watch the Camoufox context/pages/connection.
+        A previous bug ran the in-process checks ("context is None") inside
+        daemon sessions and tore down perfectly healthy daemon state after
+        the first 5-minute tick.
         """
         try:
             while self.is_running:
@@ -894,6 +1752,26 @@ class BrowserManager:
                     pass
                 if not self.is_running:
                     break
+
+                if BROWSER_MODE == "daemon":
+                    # --- daemon-scoped watchdog: nothing but the child
+                    # process exit status is authoritative here. ---
+                    proc = self._daemon_proc
+                    if proc is not None and getattr(proc, "returncode", None) is not None:
+                        logger.info("Keepalive: daemon exited — resetting state.")
+                        await self._cleanup_pw_client()
+                        self._daemon_proc = None
+                        self._daemon_reader = None
+                        self._daemon_writer = None
+                        self._remove_handshake()
+                        self._mark_dead()
+                        break
+                    # Daemon still alive → we do nothing else. Never inspect
+                    # self.context / pages from this task in daemon mode.
+                    self._user_closed_event.clear()
+                    continue
+
+                # --- in-process watchdog below ---
                 if self.context is None:
                     logger.info("Keepalive: context vanished — resetting state.")
                     self._mark_dead()
@@ -943,6 +1821,10 @@ class BrowserManager:
         self.last_video_fingerprint = None
 
     async def stop(self) -> str:
+        # ---- detached daemon mode ----
+        if BROWSER_MODE == "daemon":
+            return await self._stop_daemon_mode()
+        # ---- legacy in-process mode ----
         if not self.is_running and not self._camoufox_ctx:
             # No in-process browser — but an orphan from a previous (chat)
             # session may still hold our profile. Kill ONLY processes that
@@ -979,8 +1861,74 @@ class BrowserManager:
             logger.info("Browser stopped.")
         return "🛑 Browser stopped."
 
+    async def _stop_daemon_mode(self) -> str:
+        """Close the browser via the daemon (the deliberate-stop path)."""
+        # Case A: we have a live pipe to the daemon we spawned/attached-to
+        # this session — ask it to close everything.
+        if self._daemon_proc is not None and self._daemon_reader is not None \
+                and self._daemon_proc.returncode is None:
+            try:
+                reply = await self._daemon_request("stop", timeout=30.0)
+                if not reply.get("ok"):
+                    logger.warning(f"daemon stop error: {reply.get('error')}")
+            except Exception as e:
+                logger.warning(f"daemon stop request failed ({e}); forcing kill")
+            try:
+                await asyncio.wait_for(self._daemon_proc.wait(), timeout=10.0)
+            except Exception:
+                try:
+                    self._daemon_proc.kill()
+                except Exception:
+                    pass
+        else:
+            # Case B: no pipe (fresh server after a host-side kill of the old
+            # one, or attach-only reuse where the daemon died). The daemon is
+            # unreachable → close whatever holds OUR profile directly.
+            info = self._read_handshake()
+            if info and await self._daemon_alive(int(info.get("pid", -1))):
+                # Daemon alive but pipe lost: terminate the daemon politely;
+                # its SIGTERM policy keeps the browser, so afterwards clean
+                # the profile-scoped browser processes ourselves.
+                pid = int(info["pid"])
+                try:
+                    if os.name == "posix":
+                        os.kill(pid, _signal.SIGTERM)
+                    else:
+                        import subprocess as _sp
+                        _sp.run(["taskkill", "/PID", str(pid), "/T"],
+                                capture_output=True, timeout=10)
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+            await cleanup_stale_browser_processes(self.profile_dir)
+            remove_lock_files(self.profile_dir)
+            self._remove_handshake()
+
+        await self._cleanup_pw_client()
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except BaseException:
+                pass
+        self._daemon_proc = None
+        self._daemon_reader = None
+        self._daemon_ws = ""
+        self._intentional_stop = True
+        self.context = None
+        self._pages = []
+        self._active_page_index = 0
+        self.is_running = False
+        self.engine = "none"
+        logger.info("Browser stopped (daemon mode).")
+        return "🛑 Browser stopped (detached daemon closed)."
+
     def _require_page(self) -> None:
-        if not self.is_running or not self.page:
+        if not self.is_running:
+            raise RuntimeError("Browser not started.")
+        if self.is_daemon_mode:
+            return  # pages live in browserd; tools route via _daemon_call
+        if not self.page:
             raise RuntimeError("Browser not started.")
 
     @property
@@ -989,11 +1937,221 @@ class BrowserManager:
             return None
         return self._pages[self._active_page_index]
 
+    async def _goto(self, url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> None:
+        """Navigate the active tab — in-process or through the daemon pipe."""
+        if self.is_daemon_mode:
+            await self._daemon_call(
+                "navigate", {"url": url, "timeout": timeout_ms / 1000.0},
+                timeout=timeout_ms / 1000.0 + 15.0)
+            await self._daemon_refresh_tabs()
+            return
+        await self.page.goto(url, timeout=timeout_ms)
+
+    async def _get_content(self) -> str:
+        if self.is_daemon_mode:
+            res = await self._daemon_call("get_content", timeout=30.0)
+            return res.get("result", "")
+        return await self.page.content()
+
+    async def _current_url(self) -> str:
+        if self.is_daemon_mode:
+            if not self._daemon_urls:
+                await self._daemon_refresh_tabs()
+            idx = min(self._daemon_active, max(0, len(self._daemon_urls) - 1))
+            return self._daemon_urls[idx] if self._daemon_urls else ""
+        return self.page.url if self.page else ""
+
+    async def _screenshot(self, fname: str, full_page: bool = False) -> str:
+        if self.is_daemon_mode:
+            await self._daemon_call(
+                "screenshot", {"path": fname, "full_page": full_page}, timeout=40.0)
+            return fname
+        await self.page.screenshot(path=fname, full_page=full_page)
+        return fname
+
+    async def _press_key(self, key: str) -> None:
+        if self.is_daemon_mode:
+            await self._daemon_call("press_key", {"key": key})
+            return
+        await self.page.keyboard.press(key)
+
+    async def _scroll_by(self, delta: float) -> None:
+        if self.is_daemon_mode:
+            direction = "down" if delta >= 0 else "up"
+            await self._daemon_call("scroll",
+                                    {"direction": direction, "amount": abs(delta)})
+            return
+        await self.page.evaluate(f"window.scrollBy(0, {delta})")
+
+    async def _click_text(self, text: str) -> None:
+        if self.is_daemon_mode:
+            await self._daemon_call("click_text", {"text": text}, timeout=20.0)
+            await self._daemon_refresh_tabs()
+            return
+        await self.page.get_by_text(text, exact=False).first.click(
+            timeout=DEFAULT_TIMEOUT_MS)
+
+    async def _type_text(self, text: str, delay: int = 30) -> None:
+        """Type into the element that currently has DOM focus."""
+        if self.is_daemon_mode:
+            await self._daemon_call("type_text", {"text": text, "delay": delay})
+            return
+        await self.page.keyboard.type(text, delay=delay)
+
+    async def _focus_selector(self, selector: str) -> bool:
+        """Focus a visible element by CSS selector; True if found & focused."""
+        js = """
+        (sel) => {
+            const els = document.querySelectorAll(sel);
+            for (const el of els) {
+                if (el && el.offsetParent !== null) {
+                    el.scrollIntoView({block: 'center'});
+                    el.focus();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """
+        return bool(await self._safe_evaluate(js, selector))
+
+    async def _locator_count(self, selector: str) -> int:
+        if self.is_daemon_mode:
+            res = await self._daemon_call("locator_count", {"selector": selector})
+            return int(res.get("result", 0))
+        try:
+            return await self.page.locator(selector).count()
+        except Exception:
+            return 0
+
+    async def _locator_fill(self, selector: str, value: str) -> None:
+        if self.is_daemon_mode:
+            await self._daemon_call("locator_fill",
+                                    {"selector": selector, "value": value})
+            return
+        await self.page.locator(selector).first.fill(value)
+
+    async def _locator_click(self, selector: str) -> None:
+        if self.is_daemon_mode:
+            await self._daemon_call("locator_click", {"selector": selector})
+            await self._daemon_refresh_tabs()
+            return
+        await self.page.locator(selector).first.click(timeout=DEFAULT_TIMEOUT_MS)
+
+    async def _locator_submit(self, selector: str) -> None:
+        if self.is_daemon_mode:
+            await self._daemon_call("locator_submit", {"selector": selector})
+            await self._daemon_refresh_tabs()
+            return
+        await self.page.locator(selector).first.evaluate("el => el.submit()")
+
+    # --- Video-controller / link-cache routing (daemon-transparent) ---
+
+    class _RoutedPage:
+        """Lightweight stand-in for a Playwright Page that routes every JS
+        call through the daemon JSON-RPC pipe. Passed to VideoController and
+        LinkCache so those modules keep working UNCHANGED in daemon mode."""
+
+        def __init__(self, mgr: "BrowserManager") -> None:
+            self._mgr = mgr
+
+        @property
+        def url(self) -> str:
+            m = self._mgr
+            if not m._daemon_urls:
+                return ""
+            idx = min(m._daemon_active, len(m._daemon_urls) - 1)
+            return m._daemon_urls[idx]
+
+        async def evaluate(self, expression: str, arg: Any = None) -> Any:
+            return await self._mgr._safe_evaluate(expression, arg)
+
+        async def title(self) -> str:
+            """Async title() mirroring the real Playwright Page API (used by
+            link-cache extraction and snapshot fallbacks)."""
+            try:
+                res = await self._mgr._daemon_call(
+                    "eval", {"script": "() => document.title"}, timeout=20.0)
+                return str(res.get("result", "") or "")
+            except Exception:
+                return ""
+
+        @property
+        def keyboard(self) -> "_RoutedKeyboard":
+            return BrowserManager._RoutedKeyboard(self._mgr)
+
+    class _RoutedKeyboard:
+        def __init__(self, mgr: "BrowserManager") -> None:
+            self._mgr = mgr
+
+        async def press(self, key: str) -> None:
+            await self._mgr._press_key(key)
+
+        async def down(self, key: str) -> None:
+            await self._mgr._daemon_call("key_down", {"key": key})
+
+        async def up(self, key: str) -> None:
+            await self._mgr._daemon_call("key_up", {"key": key})
+
+        async def type(self, text: str, delay: int = 30) -> None:
+            await self._mgr._type_text(text, delay)
+
+    def _page_for_modules(self) -> Any:
+        """The object to hand to VideoController/LinkCache helpers."""
+        if self.is_daemon_mode:
+            return BrowserManager._RoutedPage(self)
+        return self.page
+
+    async def _ensure_links_fresh(self) -> None:
+        page = self._page_for_modules()
+        if page is None:
+            raise RuntimeError("Browser not started.")
+        await self.link_cache.ensure_fresh(page)
+
+    async def _new_tab(self, url: str = "") -> None:
+        if self.is_daemon_mode:
+            await self._daemon_call("new_tab", {"url": url or "about:blank"})
+            await self._daemon_refresh_tabs()
+            return
+        page = await self.context.new_page()
+        if url:
+            await page.goto(url, timeout=DEFAULT_TIMEOUT_MS)
+        self._pages.append(page)
+        self._active_page_index = len(self._pages) - 1
+        page.on("close", lambda p=page: self._on_page_closed(p))
+
+    async def _switch_tab(self, index: int) -> None:
+        if self.is_daemon_mode:
+            await self._daemon_call("switch_tab", {"index": index})
+            await self._daemon_refresh_tabs()
+            return
+        if 0 <= index < len(self._pages):
+            self._active_page_index = index
+            await self.page.bring_to_front()
+
+    async def _close_tab(self, index: Optional[int] = None) -> None:
+        if self.is_daemon_mode:
+            idx = self._daemon_active if index is None else index
+            await self._daemon_call("close_tab", {"index": idx})
+            await self._daemon_refresh_tabs()
+            return
+        idx = self._active_page_index if index is None else index
+        if 0 <= idx < len(self._pages):
+            await self._pages[idx].close()
+
     @property
     def tab_count(self) -> int:
         return len(self._pages)
 
     async def _settle(self, timeout_ms: int = 2000) -> None:
+        if self.is_daemon_mode:
+            try:
+                await self._daemon_call(
+                    "wait_ready", {"timeout": timeout_ms / 1000.0},
+                    timeout=timeout_ms / 1000.0 + 5.0)
+            except Exception:
+                pass
+            return
         if not self.page:
             return
         try:
@@ -1002,6 +2160,13 @@ class BrowserManager:
             pass
 
     async def _safe_evaluate(self, expression: str, arg: Any = None, timeout: float = 15.0) -> Any:
+        if not self.is_running:
+            raise RuntimeError("Browser not started.")
+        if self.is_daemon_mode:
+            msg = await self._daemon_call(
+                "eval", {"script": expression, "arg": arg, "timeout": timeout},
+                timeout=timeout + 10.0)
+            return msg.get("result")
         if not self.page:
             raise RuntimeError("Browser not started.")
         try:
@@ -1038,6 +2203,14 @@ class BrowserManager:
 
     async def new_tab(self, url: Optional[str] = None) -> str:
         self._require_page()
+        if self.is_daemon_mode:
+            await self._daemon_call("new_tab", {"url": url or "about:blank"})
+            await self._daemon_refresh_tabs()
+            self.link_cache.mark_dirty()
+            idx = self._daemon_active
+            if url:
+                return f"✅ New tab #{idx} opened at: {url}"
+            return f"✅ New empty tab #{idx} created and activated."
         page = await self.context.new_page()
         # _setup_page_tracking also appends via the 'page' event; guard against
         # double-append races by checking membership.
@@ -1057,6 +2230,12 @@ class BrowserManager:
 
     async def close_tab(self, index: int) -> str:
         self._require_page()
+        if self.is_daemon_mode:
+            await self._daemon_call("close_tab", {"index": index})
+            await self._daemon_refresh_tabs()
+            self.link_cache.mark_dirty()
+            return (f"🛑 Tab #{index} closed. Active tab: "
+                    f"#{self._daemon_active}.")
         if index < 0 or index >= len(self._pages):
             return f"❌ Invalid tab index {index}. Valid: 0..{len(self._pages) - 1}"
         page = self._pages[index]
@@ -1071,6 +2250,14 @@ class BrowserManager:
     def list_tabs(self) -> str:
         if not self.is_running:
             return "Browser is not running."
+        if self.is_daemon_mode:
+            # Titles are not mirrored to the server; URLs come from the last
+            # refresh (browser_list_tabs awaits _daemon_refresh_tabs first).
+            lines = []
+            for i, u in enumerate(self._daemon_urls):
+                marker = " ← active" if i == self._daemon_active else ""
+                lines.append(f"{i}. {u!r}{marker}")
+            return "\n".join(lines) if lines else "No open tabs."
         lines = []
         for i, p in enumerate(self._pages):
             marker = " ← active" if i == self._active_page_index else ""
@@ -1083,6 +2270,12 @@ class BrowserManager:
 
     async def switch_tab(self, index: int) -> str:
         self._require_page()
+        if self.is_daemon_mode:
+            await self._daemon_call("switch_tab", {"index": index})
+            await self._daemon_refresh_tabs()
+            self.link_cache.mark_dirty()
+            url = self._daemon_urls[index] if 0 <= index < len(self._daemon_urls) else ""
+            return f"✅ Switched to tab #{index}: {url}"
         if index < 0 or index >= len(self._pages):
             return f"❌ Invalid tab index {index}. Valid: 0..{len(self._pages) - 1}"
         self._active_page_index = index
@@ -1098,7 +2291,7 @@ class BrowserManager:
 # ================================================================
 # MCP TOOLS REGISTRATION
 # ================================================================
-DEFAULT_TIMEOUT_MS = 30000
+# (DEFAULT_TIMEOUT_MS defined near the top of this module)
 # L5 fix: named constant instead of magic number; truncation is announced.
 MAX_CONTENT_CHARS = 5000
 
@@ -1132,7 +2325,7 @@ async def browser_navigate(url: str) -> str:
         if error:
             return error
 
-        await browser_manager.page.goto(url, timeout=DEFAULT_TIMEOUT_MS)
+        await browser_manager._goto(url, DEFAULT_TIMEOUT_MS)
         await browser_manager._settle()
         browser_manager.link_cache.mark_dirty()
         return f"✅ Navigated to: {url}"
@@ -1145,7 +2338,7 @@ async def browser_get_content() -> str:
     """Get page content (HTML). Truncated to MAX_CONTENT_CHARS with a notice."""
     try:
         browser_manager._require_page()
-        content = await browser_manager.page.content()
+        content = await browser_manager._get_content()
         if len(content) > MAX_CONTENT_CHARS:
             return (
                 f"✅ Page content (TRUNCATED: showing {MAX_CONTENT_CHARS} of "
@@ -1176,7 +2369,7 @@ if ENABLE_SMART_NAVIGATION and ENABLE_LINK_TOOLS:
                 error = _validate_url(url)
                 if error:
                     return error
-                await browser_manager.page.goto(url, timeout=DEFAULT_TIMEOUT_MS)
+                await browser_manager._goto(url, DEFAULT_TIMEOUT_MS)
                 await browser_manager._settle()
                 browser_manager.link_cache.mark_dirty()
                 return f"✅ Opened: {url}"
@@ -1186,18 +2379,18 @@ if ENABLE_SMART_NAVIGATION and ENABLE_LINK_TOOLS:
             key = t.lower()
             if key in aliases:
                 url = aliases[key]
-                await browser_manager.page.goto(url, timeout=DEFAULT_TIMEOUT_MS)
+                await browser_manager._goto(url, DEFAULT_TIMEOUT_MS)
                 await browser_manager._settle()
                 browser_manager.link_cache.mark_dirty()
                 return f"✅ Opened alias '{t}' → {url}"
 
             # 3) link/element text on current page (fuzzy)
-            await browser_manager.link_cache.ensure_fresh(browser_manager.page)
+            await browser_manager._ensure_links_fresh()
             results = browser_manager.link_cache.search(t)
             hrefs = [r for r in results if r.get("href")]
             if len(hrefs) == 1:
                 url = hrefs[0]["href"]
-                await browser_manager.page.goto(url, timeout=DEFAULT_TIMEOUT_MS)
+                await browser_manager._goto(url, DEFAULT_TIMEOUT_MS)
                 await browser_manager._settle()
                 browser_manager.link_cache.mark_dirty()
                 return f"✅ Opened page link: {url}"
@@ -1240,12 +2433,13 @@ if ENABLE_SMART_NAVIGATION and ENABLE_LINK_TOOLS:
                 return ("⚠️ No visible search input found on this page. "
                         "Open the site first (browser_open) or use browser_navigate with a full URL.")
             # Type via keyboard so site handlers (YouTube suggestions etc.) fire natively
-            await browser_manager.page.keyboard.type(query, delay=30)
+            await browser_manager._type_text(query, delay=30)
             await asyncio.sleep(0.3)
-            await browser_manager.page.keyboard.press("Enter")
+            await browser_manager._press_key("Enter")
             await browser_manager._settle(timeout_ms=5000)
             browser_manager.link_cache.mark_dirty()
-            return f"✅ Search submitted on-page: {query!r}. Current URL: {browser_manager.page.url}"
+            return (f"✅ Search submitted on-page: {query!r}. "
+                    f"Current URL: {await browser_manager._current_url()}")
         except Exception as e:
             return f"❌ browser_search_on_page error: {e}"
 
@@ -1255,7 +2449,7 @@ if ENABLE_SMART_NAVIGATION and ENABLE_LINK_TOOLS:
         Works with JS tabs and aria-labels. Returns numbered list, does NOT click."""
         try:
             browser_manager._require_page()
-            await browser_manager.link_cache.ensure_fresh(browser_manager.page)
+            await browser_manager._ensure_links_fresh()
             results = browser_manager.link_cache.search(query)
             if not results:
                 return "⚠️ No elements found matching the query. Try a shorter substring."
@@ -1270,7 +2464,7 @@ if ENABLE_SMART_NAVIGATION and ENABLE_LINK_TOOLS:
         1 match → navigate. Multiple → list for user choice."""
         try:
             browser_manager._require_page()
-            await browser_manager.link_cache.ensure_fresh(browser_manager.page)
+            await browser_manager._ensure_links_fresh()
             results = [r for r in browser_manager.link_cache.search(query) if r.get("href")]
             if not results:
                 return ("⚠️ No matching links found. Try a shorter query or "
@@ -1281,7 +2475,7 @@ if ENABLE_SMART_NAVIGATION and ENABLE_LINK_TOOLS:
                 and results[0]["score"] < results[1]["score"]
             ):
                 url = results[0]["href"]
-                await browser_manager.page.goto(url, timeout=DEFAULT_TIMEOUT_MS)
+                await browser_manager._goto(url, DEFAULT_TIMEOUT_MS)
                 await browser_manager._settle()
                 browser_manager.link_cache.mark_dirty()
                 return f"✅ Navigated to best match: {results[0]['text'][:80]!r} → {url}"
@@ -1378,10 +2572,14 @@ async def browser_snapshot() -> str:
     """Returns JSON: URL, title, player info, video state, fingerprint.
     MANDATORY before any video action series."""
     try:
+        if browser_manager.is_daemon_mode:
+            if not browser_manager.is_running:
+                return "⏳ Browser is starting up, wait 3-5 seconds and retry."
+                
         browser_manager._require_page()
-        snapshot = await browser_manager.vc.get_snapshot(browser_manager.page) \
+        snapshot = await browser_manager.vc.get_snapshot(browser_manager._page_for_modules()) \
             if browser_manager.vc else {}
-        player_info = await browser_manager.vc.get_player_info(browser_manager.page) \
+        player_info = await browser_manager.vc.get_player_info(browser_manager._page_for_modules()) \
             if browser_manager.vc else {}
         data = {"url": snapshot.get("url"), "title": snapshot.get("title"),
                 "video": snapshot, "player": player_info,
@@ -1398,7 +2596,7 @@ if ENABLE_VIDEO_CONTROL and browser_manager.vc is not None:
         """C4: compare current video fingerprint against the last one seen.
         Returns warning string when the video changed mid-series, else None.
         Also refreshes the stored fingerprint."""
-        snap = await browser_manager.vc.get_snapshot(browser_manager.page)
+        snap = await browser_manager.vc.get_snapshot(browser_manager._page_for_modules())
         fp = snap.get("fingerprint", "")
         prev = browser_manager.last_video_fingerprint
         browser_manager.last_video_fingerprint = fp
@@ -1413,9 +2611,13 @@ if ENABLE_VIDEO_CONTROL and browser_manager.vc is not None:
         """Check video state BEFORE a series of video actions. Sets the fingerprint
         baseline that video_action() enforces during the series."""
         try:
+            if browser_manager.is_daemon_mode:
+                if not browser_manager.is_running:
+                    return "⏳ Browser is starting up, wait 3-5 seconds and retry."
+            
             browser_manager._require_page()
-            snapshot = await browser_manager.vc.get_snapshot(browser_manager.page)
-            player_info = await browser_manager.vc.get_player_info(browser_manager.page)
+            snapshot = await browser_manager.vc.get_snapshot(browser_manager._page_for_modules())
+            player_info = await browser_manager.vc.get_player_info(browser_manager._page_for_modules())
             browser_manager.last_video_fingerprint = snapshot.get("fingerprint")
             return json.dumps({"video": snapshot, "player": player_info},
                               indent=2, ensure_ascii=False)
@@ -1429,10 +2631,14 @@ if ENABLE_VIDEO_CONTROL and browser_manager.vc is not None:
         returns ⚠️ and you MUST stop the series immediately (skill rule #5).
         After menu interactions call video_action('cleanup','menu')."""
         try:
+            if browser_manager.is_daemon_mode:
+                if not browser_manager.is_running:
+                    return "⏳ Browser is starting up, wait 3-5 seconds and retry."
+            
             browser_manager._require_page()
             if action in ("state", "download_source", "cleanup"):
                 # Read-only / housekeeping commands don't need the gate.
-                return await browser_manager.vc.action(browser_manager.page, action, param)
+                return await browser_manager.vc.action(browser_manager._page_for_modules(), action, param)
 
             gate = await _video_fingerprint_gate()
             if gate:
@@ -1444,14 +2650,14 @@ if ENABLE_VIDEO_CONTROL and browser_manager.vc is not None:
             if action.startswith(("volume", "mute")):
                 try:
                     pre_snap = await browser_manager.vc.get_snapshot(
-                        browser_manager.page)
+                        browser_manager._page_for_modules())
                 except Exception:
                     pre_snap = None
 
-            result = await browser_manager.vc.action(browser_manager.page, action, param)
+            result = await browser_manager.vc.action(browser_manager._page_for_modules(), action, param)
 
             # Verify post-state where possible and refresh baseline after mutation
-            snap = await browser_manager.vc.get_snapshot(browser_manager.page)
+            snap = await browser_manager.vc.get_snapshot(browser_manager._page_for_modules())
             browser_manager.last_video_fingerprint = snap.get("fingerprint")
             if result.startswith("✅"):
                 state_bits = (f" [paused={snap.get('paused')}, "
@@ -1501,8 +2707,8 @@ if ENABLE_SCREENSHOT:
             browser_manager._require_page()
             shots_dir = os.path.join(BASE_DIR, "screenshots")
             os.makedirs(shots_dir, exist_ok=True)
-            fname = os.path.join(shots_dir, f"shot_{int(time_module.time())}.png")
-            await browser_manager.page.screenshot(path=fname, full_page=full_page)
+            fname = os.path.join(shots_dir, f"shot_{int(time.time())}.png")
+            await browser_manager._screenshot(fname, full_page)
             return f"✅ Screenshot saved: {fname}"
         except Exception as e:
             return f"❌ Screenshot error: {e}"
@@ -1540,6 +2746,8 @@ if ENABLE_TAB_TOOLS:
     async def browser_list_tabs() -> str:
         """List open tabs with indices, titles and URLs; marks the active one."""
         try:
+            if browser_manager.is_daemon_mode:
+                await browser_manager._daemon_refresh_tabs()
             return browser_manager.list_tabs()
         except Exception as e:
             return f"❌ List tabs error: {e}"
@@ -1575,7 +2783,7 @@ if ENABLE_SCROLL_TOOLS:
             k = (key or "").strip()
             if not k:
                 return "❌ Empty key name."
-            await browser_manager.page.keyboard.press(k)
+            await browser_manager._press_key(k)
             return f"✅ Key pressed: {k}"
         except Exception as e:
             return f"❌ Press key error: {e}"
@@ -1648,25 +2856,51 @@ if ENABLE_FORM_TOOLS:
             except Exception:
                 return "❌ fields_json is not valid JSON."
             filled, skipped = [], []
+            # Pure-JS field filling: identical behaviour in-process and via
+            # the daemon pipe (no Playwright locator objects required).
+            js_fill = """
+            ([formSel, name, value]) => {
+                const forms = document.querySelectorAll(formSel);
+                let el = null;
+                for (const form of forms) {
+                    el = form.querySelector('[name="' + name + '"], #' + name)
+                      || form.querySelector('[aria-label="' + name + '"]');
+                    if (el) break;
+                }
+                if (!el) el = document.querySelector(
+                    '[name="' + name + '"], #' + name + ', [aria-label="' + name + '"]');
+                if (!el) return {found: false};
+                if (el.offsetParent === null && !(el.type === 'hidden'))
+                    return {found: true, hidden: true};
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'select') {
+                    let ok = false;
+                    for (const opt of el.options) {
+                        if (opt.textContent.trim() === String(value)) {
+                            opt.selected = true; ok = true; break;
+                        }
+                    }
+                    if (!ok) return {found: true, hidden: false, error: 'option not found'};
+                } else {
+                    el.value = String(value);
+                }
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return {found: true, hidden: false};
+            }
+            """
             for key, value in fields.items():
                 try:
-                    loc = browser_manager.page.locator(selector).locator(
-                        f'[name="{key}"], [id="{key}"], [aria-label="{key}"], label:has-text("{key}") ~ *'
-                    ).first
-                    alt = browser_manager.page.locator(f'{selector} >> nth=0')
-                    target = loc if await loc.count() > 0 else browser_manager.page.locator(key).first
-                    if await target.count() == 0:
+                    res = await browser_manager._safe_evaluate(
+                        js_fill, [selector, key, str(value)])
+                    if not res or not res.get("found"):
                         skipped.append(f"{key}: not found")
-                        continue
-                    if not await target.is_visible():
+                    elif res.get("hidden"):
                         skipped.append(f"{key}: hidden (possible honeypot) — SKIPPED")
-                        continue
-                    tag_name = (await target.evaluate("el => el.tagName.toLowerCase()")) 
-                    if tag_name == "select":
-                        await target.select_option(label=str(value))
+                    elif res.get("error"):
+                        skipped.append(f"{key}: {res['error']}")
                     else:
-                        await target.fill(str(value))
-                    filled.append(key)
+                        filled.append(key)
                 except Exception as ie:
                     skipped.append(f"{key}: {ie}")
             summary = f"✅ Filled {len(filled)} field(s): {filled}"
@@ -1681,21 +2915,37 @@ if ENABLE_FORM_TOOLS:
         """Submit a form. NOTE: for payments/deletions you MUST get explicit user confirmation first."""
         try:
             browser_manager._require_page()
-            btn = browser_manager.page.locator(
-                f'{selector} button[type="submit"], {selector} input[type="submit"]'
-            ).first
-            if await btn.count() > 0:
-                await btn.click(timeout=DEFAULT_TIMEOUT_MS)
+            sub_sel = (f'{selector} button[type="submit"], '
+                       f'{selector} input[type="submit"]')
+            if await browser_manager._locator_count(sub_sel) > 0:
+                await browser_manager._locator_click(sub_sel)
             else:
-                await browser_manager.page.locator(selector).first.evaluate("el => el.submit()")
+                await browser_manager._locator_submit(selector)
             await browser_manager._settle(timeout_ms=5000)
             browser_manager.link_cache.mark_dirty()
-            return f"✅ Form submitted. Current URL: {browser_manager.page.url}"
+            return ("✅ Form submitted. Current URL: "
+                    f"{await browser_manager._current_url()}")
         except Exception as e:
             return f"❌ Submit form error: {e}"
 
 
 # Start MCP server
 if __name__ == "__main__":
+    # Windows: pin the SELECTOR event-loop policy before mcp.run() creates
+    # its loop.  The default ProactorEventLoop registers inherited std pipe
+    # handles with an IOCP completion port; on some systems (the user's
+    # Python 3.13 install reproduced it for EVERY detached child) that
+    # registration raises WinError 6 and poisons the handles — which is
+    # what killed our daemon's stdin/stdout transport.  Selector loops use
+    # blocking socket semantics, never touch IOCP, and are fully supported
+    # for subprocess pipes in CPython.  Our own MCP stdio transport keeps
+    # working: asyncio falls back to thread-based reads/writes for plain
+    # console/pipe handles under the selector policy.
+    if os.name == "nt":
+        try:
+            import asyncio.windows_events as _wev
+            _wev.set_event_loop_policy(_wev.WindowsSelectorEventLoopPolicy())
+        except Exception:
+            pass
     logger.info("Starting FirefoxMCP server...")
     mcp.run(transport="stdio")
