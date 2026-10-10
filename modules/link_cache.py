@@ -185,7 +185,11 @@ class LinkCache:
         3. Token subset match (ALL query words present in target) - NEW
         4. Partial token overlap (>=60% query words present) - NEW
         5. Fuzzy match (Levenshtein)
-        
+
+        Results are sorted by (priority bucket, score) — the bucket always
+        dominates, so a lower-priority fuzzy hit can never outrank a
+        higher-priority contains/subset hit regardless of raw score.
+
         Handles abbreviated queries like "приказ мосты" matching
         "Приказ уничтожить все мосты - снос переправ..."
         """
@@ -195,11 +199,8 @@ class LinkCache:
 
         q_words = self._get_meaningful_words(query)
 
-        results_exact: List[Dict[str, Any]] = []
-        results_contains: List[Dict[str, Any]] = []
-        results_token_subset: List[Dict[str, Any]] = []
-        results_partial_overlap: List[Dict[str, Any]] = []
-        results_fuzzy: List[Dict[str, Any]] = []
+        # Priority buckets (lower index = higher priority)
+        buckets: List[List[Dict[str, Any]]] = [[], [], [], [], []]
 
         for link in self.links:
             t_norm = self._normalize(link['text'])
@@ -208,41 +209,47 @@ class LinkCache:
             if not t_norm:
                 continue
 
+            # Explicit per-link initialization: previously `t_words` was only
+            # bound inside step 3 and leaked into step 4 via short-circuit —
+            # fragile against any condition refactor (UnboundLocalError risk).
+            t_words = self._get_meaningful_words(link['text'])
+
             # 1. Exact match
             if t_norm == q_norm:
-                results_exact.append({**link, 'match_type': 'exact', 'score': 0})
+                buckets[0].append({**link, 'match_type': 'exact', 'score': 0})
                 continue
 
             # 2. Substring containment (query is inside text, or text inside query)
             if q_norm in t_norm or t_norm in q_norm:
                 score = abs(len(t_norm) - len(q_norm))
-                results_contains.append({**link, 'match_type': 'contains', 'score': score})
+                buckets[1].append({**link, 'match_type': 'contains', 'score': score})
                 continue
 
             # 3. Token subset match (ALL query words present in target text)
-            if q_words:
-                t_words = self._get_meaningful_words(link['text'])
-                if q_words.issubset(t_words):
-                    # Score based on how many extra words target has
-                    extra_words = len(t_words) - len(q_words)
-                    results_token_subset.append({**link, 'match_type': 'token_subset', 'score': extra_words})
-                    continue
+            if q_words and q_words.issubset(t_words):
+                # Score based on how many extra words target has
+                extra_words = len(t_words) - len(q_words)
+                buckets[2].append({**link, 'match_type': 'token_subset', 'score': extra_words})
+                continue
 
             # 4. Partial token overlap (>=60% query words present)
             if q_words and t_words:
                 overlap = q_words.intersection(t_words)
                 if len(overlap) >= max(1, int(len(q_words) * 0.6)):
                     overlap_ratio = len(overlap) / len(q_words)
-                    results_partial_overlap.append({**link, 'match_type': 'partial_overlap', 'score': 10 - int(overlap_ratio * 10)})
+                    buckets[3].append({**link, 'match_type': 'partial_overlap',
+                                       'score': 10 - int(overlap_ratio * 10)})
                     continue
 
             # 5. Fuzzy match (Levenshtein)
             dist = self._levenshtein(q_norm, t_norm)
             if dist <= max(3, len(q_norm) // 3):
-                results_fuzzy.append({**link, 'match_type': 'fuzzy', 'score': dist})
+                buckets[4].append({**link, 'match_type': 'fuzzy', 'score': dist})
 
-        # Combine results in priority order
-        all_results = results_exact + results_contains + results_token_subset + results_partial_overlap + results_fuzzy
-        # Sort by score (lower is better)
-        all_results.sort(key=lambda x: x['score'])
+        # Sort WITHIN each bucket by score, then concatenate in strict
+        # priority order (bucket dominates; score only breaks ties inside it).
+        all_results: List[Dict[str, Any]] = []
+        for bucket in buckets:
+            bucket.sort(key=lambda x: x['score'])
+            all_results.extend(bucket)
         return all_results[:20]  # Return top 20 results
